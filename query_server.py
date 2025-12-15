@@ -79,26 +79,72 @@ def query_server(db, iteration):
         
         db.collection('live').document('status').set(live_data)
         
-        # Update players
+        # Update players - chercher d'abord si le joueur existe déjà
         for p in players:
-            player_id = f"auto_{p['name'].lower().replace(' ', '_')}"
-            player_ref = db.collection('players').document(player_id)
-            player_doc = player_ref.get()
+            player_name = p['name']
+            player_name_lower = player_name.lower()
             
-            if player_doc.exists:
-                player_data = player_doc.to_dict()
+            # Chercher le joueur par son nom ou ses noms in-game
+            existing_player = None
+            existing_player_id = None
+            
+            # Requête 1: Chercher par nom exact
+            query = db.collection('players').where('name', '==', player_name).limit(1).get()
+            if query:
+                existing_player = query[0]
+                existing_player_id = existing_player.id
+            
+            # Requête 2: Si pas trouvé, chercher dans ingame_names
+            if not existing_player:
+                query = db.collection('players').where('ingame_names', 'array_contains', player_name).limit(1).get()
+                if query:
+                    existing_player = query[0]
+                    existing_player_id = existing_player.id
+            
+            # Requête 3: Si toujours pas trouvé, chercher par nom en minuscules (moins fiable mais utile)
+            if not existing_player:
+                # Chercher tous les joueurs et comparer manuellement (fallback)
+                all_players = db.collection('players').get()
+                for doc in all_players:
+                    data = doc.to_dict()
+                    # Comparer le nom
+                    if data.get('name', '').lower() == player_name_lower:
+                        existing_player = doc
+                        existing_player_id = doc.id
+                        break
+                    # Comparer les noms in-game
+                    ingame = data.get('ingame_names', [])
+                    if any(n.lower() == player_name_lower for n in ingame):
+                        existing_player = doc
+                        existing_player_id = doc.id
+                        break
+            
+            if existing_player:
+                # Mettre à jour le joueur existant
+                player_data = existing_player.to_dict()
                 current_total = player_data.get('total_time_seconds', 0)
-                player_ref.update({
+                
+                update_data = {
                     'last_seen': firestore.SERVER_TIMESTAMP,
                     'total_time_seconds': current_total + 60,
                     'current_session_time': p['time']
-                })
+                }
+                
+                # Ajouter le nom aux ingame_names s'il n'y est pas
+                ingame_names = player_data.get('ingame_names', [])
+                if player_name not in ingame_names and player_name != player_data.get('name'):
+                    ingame_names.append(player_name)
+                    update_data['ingame_names'] = ingame_names
+                
+                db.collection('players').document(existing_player_id).update(update_data)
             else:
-                player_ref.set({
-                    'name': p['name'],
+                # Nouveau joueur - créer avec un ID auto
+                player_id = f"auto_{player_name_lower.replace(' ', '_').replace('.', '_')}"
+                db.collection('players').document(player_id).set({
+                    'name': player_name,
                     'steam_id': player_id,
                     'roles': ['??'],
-                    'ingame_names': [p['name']],
+                    'ingame_names': [player_name],
                     'created_at': firestore.SERVER_TIMESTAMP,
                     'last_seen': firestore.SERVER_TIMESTAMP,
                     'total_time_seconds': p['time'],
