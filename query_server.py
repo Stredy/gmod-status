@@ -295,12 +295,20 @@ def query_server(db, iteration):
                 player_data = existing_player.to_dict()
                 current_total = player_data.get('total_time_seconds', 0)
                 steam_id = player_data.get('steam_id', existing_player_id)
+                previous_session_time = player_data.get('current_session_time', 0)
                 
                 update_data = {
                     'last_seen': firestore.SERVER_TIMESTAMP,
                     'total_time_seconds': current_total + 60,
                     'current_session_time': p['time']
                 }
+                
+                # Incrémenter le compteur de sessions si nouvelle connexion
+                # Une nouvelle session = temps actuel < temps précédent (le joueur s'est reconnecté)
+                if p['time'] < previous_session_time:
+                    current_sessions = player_data.get('session_count', 0)
+                    update_data['session_count'] = current_sessions + 1
+                    print(f"          📊 Nouvelle session détectée! Total: {current_sessions + 1}")
                 
                 # Ajouter le nom aux ingame_names s'il n'y est pas
                 ingame_names = player_data.get('ingame_names', [])
@@ -332,6 +340,7 @@ def query_server(db, iteration):
                     'last_seen': firestore.SERVER_TIMESTAMP,
                     'total_time_seconds': p['time'],
                     'current_session_time': p['time'],
+                    'session_count': 1,
                     'is_auto_detected': True
                 })
         
