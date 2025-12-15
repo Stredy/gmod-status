@@ -19,6 +19,19 @@ from firebase_admin import credentials, firestore
 GMOD_HOST = os.environ.get('GMOD_HOST', '51.91.215.65')
 GMOD_PORT = int(os.environ.get('GMOD_PORT', '27015'))
 
+def format_duration(seconds):
+    """Formate une durée en heures:minutes:secondes."""
+    if seconds < 60:
+        return f"{seconds}s"
+    
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    
+    if hours > 0:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m{secs:02d}s"
+
 def init_firebase():
     """Initialise Firebase avec les credentials depuis la variable d'environnement."""
     try:
@@ -82,8 +95,10 @@ def query_gmod_server():
         print(f'✅ Serveur en ligne: {data["count"]}/{data["maxPlayers"]} joueurs sur {data["map"]}')
         
         if players:
-            player_names = [p['name'] for p in players]
-            print(f'   Joueurs: {", ".join(player_names)}')
+            print('   Joueurs:')
+            for p in players:
+                time_str = format_duration(p['time'])
+                print(f'      • {p["name"]} ({time_str})')
         
         return data
         
