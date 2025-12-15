@@ -1,444 +1,364 @@
 #!/usr/bin/env python3
 """
-GMod Server Status - GitHub Actions
-Queries a GMod server using A2S protocol and syncs to Firebase
-Runs in a loop to achieve ~1 minute update frequency
+GMod Server Status v8.1 - Ultra Optimized for Spark Plan
+- Writes ONLY on changes
+- Avatar checked on JOIN, written only if different
+- Synced to exact minute (:00)
 """
 
 import os
 import sys
 import json
-import time
 import re
+import time
 import unicodedata
 import requests
-from html.parser import HTMLParser
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List
+from typing import Optional, Dict, Set
 
 import a2s
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# Configuration
 GMOD_HOST = os.environ.get('GMOD_HOST', '51.91.215.65')
 GMOD_PORT = int(os.environ.get('GMOD_PORT', '27015'))
-LOOP_COUNT = int(os.environ.get('LOOP_COUNT', '5'))  # Nombre de requêtes par exécution
-LOOP_DELAY = int(os.environ.get('LOOP_DELAY', '55'))  # Délai entre requêtes (secondes)
 
-# Timezone France (UTC+1 hiver, UTC+2 été)
-# On utilise une approximation simple pour l'heure française
 def get_france_time():
-    """Retourne l'heure actuelle en France (approximation UTC+1)"""
-    utc_now = datetime.now(timezone.utc)
-    # France est UTC+1 en hiver, UTC+2 en été
-    # Approximation simple: UTC+1 (on peut améliorer avec pytz si besoin)
-    france_offset = timedelta(hours=1)
-    return utc_now + france_offset
+    return datetime.now(timezone.utc) + timedelta(hours=1)
 
-# Steam Avatar Configuration
+def wait_for_next_minute():
+    """Attendre jusqu'à la prochaine minute :00"""
+    now = datetime.now()
+    seconds_to_wait = 60 - now.second - (now.microsecond / 1_000_000)
+    if 0 < seconds_to_wait < 60:
+        print(f"    ⏳ Sync: attente {seconds_to_wait:.1f}s jusqu'à XX:{(now.minute + 1) % 60:02d}:00")
+        time.sleep(seconds_to_wait)
+
 STEAMID64_BASE = 76561197960265728
 STEAM2_RE = re.compile(r"^STEAM_[0-5]:([0-1]):(\d+)$", re.IGNORECASE)
 
 def normalize_name(name):
-    """
-    Normalise un nom pour la comparaison:
-    - Convertit en minuscules
-    - Supprime les accents
-    - Garde seulement les lettres et chiffres
-    """
     if not name:
         return ""
-    # Convertir en minuscules
     name = name.lower().strip()
-    # Supprimer les accents
     name = unicodedata.normalize('NFD', name)
     name = ''.join(c for c in name if unicodedata.category(c) != 'Mn')
-    # Garder seulement alphanumériques
-    name = re.sub(r'[^a-z0-9]', '', name)
-    return name
+    return re.sub(r'[^a-z0-9]', '', name)
 
-# ============================================
-# Steam Avatar Scraper
-# ============================================
-
-def steam2_to_steamid64(steamid: str) -> Optional[str]:
-    """Convertit STEAM_0:0:123456789 en SteamID64"""
-    steamid = steamid.strip()
-    if steamid.isdigit() and len(steamid) >= 16:
-        return steamid
-    m = STEAM2_RE.match(steamid)
-    if not m:
+def steam2_to_steam64(steamid):
+    match = STEAM2_RE.match(steamid)
+    if not match:
         return None
-    x = int(m.group(1))
-    z = int(m.group(2))
-    accountid = 2 * z + x
-    return str(STEAMID64_BASE + accountid)
+    return str(STEAMID64_BASE + (int(match.group(2)) * 2) + int(match.group(1)))
 
-class SteamAvatarParser(HTMLParser):
-    """Parse la page profil Steam pour extraire l'avatar"""
-    def __init__(self):
-        super().__init__()
-        self.in_inner = 0
-        self.in_frame = 0
-        self.animated = None
-        self.static_candidates = []
-
-    def _first_url_from_srcset(self, srcset: str) -> Optional[str]:
-        if not srcset:
-            return None
-        first = srcset.split(",")[0].strip()
-        if not first:
-            return None
-        return first.split(" ")[0].strip()
-
-    def handle_starttag(self, tag: str, attrs):
-        a = dict(attrs)
-        klass = a.get("class", "")
-
-        if tag == "div":
-            if "playerAvatarAutoSizeInner" in klass:
-                self.in_inner += 1
-            elif self.in_inner > 0 and "profile_avatar_frame" in klass:
-                self.in_frame += 1
-
-        if self.in_inner <= 0 or self.in_frame > 0:
-            return
-
-        if tag == "img":
-            url = None
-            if "srcset" in a:
-                url = self._first_url_from_srcset(a.get("srcset", ""))
-            if not url and "src" in a:
-                url = a.get("src")
-
-            if url:
-                lower_url = url.lower()
-                if self.animated is None and any(lower_url.endswith(ext) for ext in (".gif", ".webm", ".mp4")):
-                    self.animated = url
-                elif any(lower_url.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
-                    self.static_candidates.append(url)
-
-        if tag == "source":
-            media = (a.get("media") or "").strip()
-            url = self._first_url_from_srcset(a.get("srcset", "") or "")
-            if url and any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
-                if "prefers-reduced-motion" in media:
-                    self.static_candidates.insert(0, url)
-                else:
-                    self.static_candidates.append(url)
-
-    def handle_endtag(self, tag: str):
-        if tag != "div":
-            return
-        if self.in_frame > 0:
-            self.in_frame -= 1
-            return
-        if self.in_inner > 0:
-            self.in_inner -= 1
-
-def fetch_steam_avatar(steam_id: str) -> Optional[str]:
-    """Récupère l'URL de l'avatar Steam à partir d'un Steam ID"""
+def fetch_steam_avatar(steamid):
+    """Récupère l'avatar Steam actuel"""
     try:
-        steamid64 = steam2_to_steamid64(steam_id)
-        if not steamid64:
+        steam64 = steam2_to_steam64(steamid)
+        if not steam64:
             return None
         
-        url = f"https://steamcommunity.com/profiles/{steamid64}/?l=english"
-        r = requests.get(
-            url,
-            timeout=10,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
+        response = requests.get(
+            f"https://steamcommunity.com/profiles/{steam64}",
+            timeout=5,
+            headers={'User-Agent': 'Mozilla/5.0'}
         )
-        r.raise_for_status()
+        if response.status_code != 200:
+            return None
         
-        parser = SteamAvatarParser()
-        parser.feed(r.text)
-        
-        # Priorité à l'avatar animé, sinon statique
-        if parser.animated:
-            return parser.animated
-        if parser.static_candidates:
-            return parser.static_candidates[0]
-        
+        for pattern in [r'<link rel="image_src" href="([^"]+)"', r'<meta property="og:image" content="([^"]+)"']:
+            match = re.search(pattern, response.text)
+            if match and 'steamcommunity.com' in match.group(1):
+                return match.group(1).replace('_medium', '_full')
         return None
-    except Exception as e:
-        print(f"       ⚠️ Erreur avatar pour {steam_id}: {e}")
+    except:
         return None
 
-def format_duration(seconds):
-    """Format seconds to human readable duration"""
-    if not seconds or seconds < 60:
-        return "< 1m"
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    if hours > 0:
-        return f"{hours}h{minutes:02d}m"
-    return f"{minutes}m"
+def init_firebase():
+    if firebase_admin._apps:
+        return firestore.client()
+    
+    service_account_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
+    if not service_account_json:
+        raise ValueError("FIREBASE_SERVICE_ACCOUNT not set")
+    
+    cred = credentials.Certificate(json.loads(service_account_json))
+    firebase_admin.initialize_app(cred)
+    return firestore.client()
 
-def query_server(db, iteration):
-    """Query server and update Firebase"""
-    address = (GMOD_HOST, GMOD_PORT)
-    now = datetime.now(timezone.utc)
-    france_now = get_france_time()
-    
-    print(f"\n[{iteration}] 🎮 Query {GMOD_HOST}:{GMOD_PORT} à {france_now.strftime('%H:%M:%S')} (France)")
-    
+def query_gmod_server(host: str, port: int) -> Optional[dict]:
     try:
-        # Get server info
+        address = (host, port)
         info = a2s.info(address, timeout=10)
+        players = a2s.players(address, timeout=10)
         
-        # Get players
-        players_raw = a2s.players(address, timeout=10)
-        
-        # Format players data
-        players = []
-        for p in players_raw:
+        player_list = []
+        for p in sorted(players, key=lambda x: x.duration, reverse=True):
             if p.name and p.name.strip():
-                players.append({
-                    "name": p.name,
-                    "score": p.score,
-                    "time": int(p.duration)
+                player_list.append({
+                    'name': p.name.strip(),
+                    'time': int(p.duration)
                 })
         
-        players.sort(key=lambda x: x['time'], reverse=True)
-        
-        print(f"    ✅ {len(players)}/{info.max_players} joueurs sur {info.map_name}")
-        
-        if players:
-            for p in players[:5]:
-                print(f"       • {p['name']} ({format_duration(p['time'])})")
-            if len(players) > 5:
-                print(f"       ... et {len(players) - 5} autres")
-        
-        # Update live status
-        live_data = {
-            "ok": True,
-            "serverName": info.server_name,
-            "map": info.map_name,
-            "count": len(players),
-            "maxPlayers": info.max_players,
-            "players": players,
-            "timestamp": now.isoformat(),
-            "updatedAt": now.isoformat()
+        return {
+            'server_name': info.server_name,
+            'map': info.map_name,
+            'players': player_list,
+            'max_players': info.max_players,
+            'count': len(player_list)
         }
+    except Exception as e:
+        print(f"    ❌ Server error: {e}")
+        return None
+
+def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime):
+    """
+    Ultra-optimized sync - writes only on actual changes
+    """
+    try:
+        current_players = {p['name']: p['time'] for p in server_data['players']}
+        current_names = set(current_players.keys())
         
-        db.collection('live').document('status').set(live_data)
+        # 1. Get previous state
+        live_doc = db.collection('live').document('status').get()
+        previous_names: Set[str] = set()
+        previous_data = {}
         
-        # Update players - chercher d'abord si le joueur existe déjà
-        for p in players:
-            player_name = p['name']
-            player_name_lower = player_name.lower().strip()
-            # Normaliser le nom pour la comparaison (enlever accents, caractères spéciaux)
-            player_name_normalized = normalize_name(player_name)
-            
-            print(f"       🔍 Recherche: '{player_name}'")
-            
-            # Chercher le joueur dans tous les documents
-            existing_player = None
-            existing_player_id = None
-            
-            all_players = db.collection('players').get()
+        if live_doc.exists:
+            prev = live_doc.to_dict()
+            for p in prev.get('players', []):
+                previous_names.add(p['name'])
+                previous_data[p['name']] = p
+        
+        # 2. Detect changes
+        joined = current_names - previous_names
+        left = previous_names - current_names
+        stayed = current_names & previous_names
+        
+        print(f"       📊 +{len(joined)} | -{len(left)} | ={len(stayed)}")
+        
+        # 3. Load player docs ONLY if needed
+        players_cache: Dict[str, tuple] = {}
+        
+        if joined or left:
+            all_players = list(db.collection('players').get())
             for doc in all_players:
                 data = doc.to_dict()
-                doc_name = data.get('name', '')
-                doc_name_lower = doc_name.lower().strip()
-                doc_name_normalized = normalize_name(doc_name)
-                
-                # Match par nom exact
-                if doc_name == player_name:
-                    existing_player = doc
-                    existing_player_id = doc.id
-                    print(f"          ✓ Match exact: {doc.id}")
-                    break
-                
-                # Match par nom normalisé (insensible à la casse)
-                if doc_name_lower == player_name_lower:
-                    existing_player = doc
-                    existing_player_id = doc.id
-                    print(f"          ✓ Match lowercase: {doc.id}")
-                    break
-                
-                # Match par nom normalisé (sans caractères spéciaux)
-                if doc_name_normalized == player_name_normalized and player_name_normalized:
-                    existing_player = doc
-                    existing_player_id = doc.id
-                    print(f"          ✓ Match normalized: {doc.id}")
-                    break
-                
-                # Match dans ingame_names
-                ingame_names = data.get('ingame_names', [])
-                for ingame in ingame_names:
-                    ingame_lower = ingame.lower().strip()
-                    ingame_normalized = normalize_name(ingame)
-                    
-                    if ingame == player_name or ingame_lower == player_name_lower:
-                        existing_player = doc
-                        existing_player_id = doc.id
-                        print(f"          ✓ Match ingame_name: {doc.id} ({ingame})")
-                        break
-                    
-                    if ingame_normalized == player_name_normalized and player_name_normalized:
-                        existing_player = doc
-                        existing_player_id = doc.id
-                        print(f"          ✓ Match ingame normalized: {doc.id} ({ingame})")
-                        break
-                
-                if existing_player:
-                    break
+                name = data.get('name', '')
+                players_cache[name.lower().strip()] = (doc.id, data)
+                players_cache[normalize_name(name)] = (doc.id, data)
+                for ingame in data.get('ingame_names', []):
+                    players_cache[ingame.lower().strip()] = (doc.id, data)
+                    players_cache[normalize_name(ingame)] = (doc.id, data)
+        
+        writes = 0
+        
+        # 4. Handle JOINED players
+        for name in joined:
+            session_time = current_players[name]
+            key = name.lower().strip()
+            key_norm = normalize_name(name)
             
-            if existing_player:
-                # Mettre à jour le joueur existant
-                player_data = existing_player.to_dict()
-                current_total = player_data.get('total_time_seconds', 0)
-                steam_id = player_data.get('steam_id', existing_player_id)
-                previous_session_time = player_data.get('current_session_time', 0)
+            existing = players_cache.get(key) or players_cache.get(key_norm)
+            
+            if existing:
+                doc_id, data = existing
+                steam_id = data.get('steam_id', '')
+                current_avatar = data.get('avatar_url')
                 
-                update_data = {
+                # Toujours vérifier l'avatar à l'arrivée
+                update_needed = False
+                update = {
                     'last_seen': firestore.SERVER_TIMESTAMP,
-                    'total_time_seconds': current_total + 60,
-                    'current_session_time': p['time']
+                    'connected_at': now.isoformat(),
+                    'current_session_start': session_time,
+                    'session_count': data.get('session_count', 0) + 1
                 }
+                update_needed = True
                 
-                # Incrémenter le compteur de sessions si nouvelle connexion
-                # Une nouvelle session = temps actuel < temps précédent (le joueur s'est reconnecté)
-                if p['time'] < previous_session_time:
-                    current_sessions = player_data.get('session_count', 0)
-                    update_data['session_count'] = current_sessions + 1
-                    print(f"          📊 Nouvelle session détectée! Total: {current_sessions + 1}")
+                # Vérifier avatar si Steam ID valide
+                if steam_id.startswith('STEAM_'):
+                    new_avatar = fetch_steam_avatar(steam_id)
+                    if new_avatar and new_avatar != current_avatar:
+                        update['avatar_url'] = new_avatar
+                        print(f"          🖼️ Avatar mis à jour: {name}")
                 
-                # Ajouter le nom aux ingame_names s'il n'y est pas
-                ingame_names = player_data.get('ingame_names', [])
-                if player_name not in ingame_names and player_name != player_data.get('name'):
-                    ingame_names.append(player_name)
-                    update_data['ingame_names'] = ingame_names
+                # Ajouter aux ingame_names si nécessaire
+                ingame = data.get('ingame_names', [])
+                if name not in ingame and name != data.get('name'):
+                    update['ingame_names'] = ingame + [name]
                 
-                # Récupérer l'avatar si pas déjà présent et si c'est un vrai Steam ID
-                current_avatar = player_data.get('avatar_url')
-                if not current_avatar and steam_id.startswith('STEAM_'):
-                    print(f"       🖼️ Récupération avatar pour {steam_id}...")
-                    avatar_url = fetch_steam_avatar(steam_id)
-                    if avatar_url:
-                        update_data['avatar_url'] = avatar_url
-                        print(f"          ✓ Avatar trouvé!")
-                
-                db.collection('players').document(existing_player_id).update(update_data)
-                print(f"          ✓ Mis à jour: +60s (total: {current_total + 60}s)")
+                db.collection('players').document(doc_id).update(update)
+                writes += 1
+                print(f"          ⬆️ {name}")
             else:
-                # Nouveau joueur - créer avec un ID auto
-                player_id = f"auto_{player_name_lower.replace(' ', '_').replace('.', '_')}"
-                print(f"          ➕ Nouveau joueur auto: {player_id}")
-                db.collection('players').document(player_id).set({
-                    'name': player_name,
-                    'steam_id': player_id,
+                # Nouveau joueur
+                doc_id = f"auto_{key.replace(' ', '_').replace('.', '_')[:50]}"
+                db.collection('players').document(doc_id).set({
+                    'name': name,
+                    'steam_id': doc_id,
                     'roles': ['Joueur'],
                     'ingame_names': [],
                     'created_at': firestore.SERVER_TIMESTAMP,
                     'last_seen': firestore.SERVER_TIMESTAMP,
-                    'total_time_seconds': p['time'],
-                    'current_session_time': p['time'],
+                    'connected_at': now.isoformat(),
+                    'current_session_start': session_time,
+                    'total_time_seconds': 0,
                     'session_count': 1,
                     'is_auto_detected': True
                 })
+                writes += 1
+                print(f"          ➕ {name}")
         
-        # Update daily stats (using France time)
-        today = france_now.strftime('%Y-%m-%d')
-        current_hour = france_now.hour
-        stats_ref = db.collection('stats').document('daily').collection('days').document(today)
-        stats_doc = stats_ref.get()
-        
-        if stats_doc.exists:
-            stats_data = stats_doc.to_dict()
-            hourly = stats_data.get('hourly', {})
-            hourly[str(current_hour)] = max(hourly.get(str(current_hour), 0), len(players))
-            stats_ref.update({
-                'peak': max(stats_data.get('peak', 0), len(players)),
-                'hourly': hourly,
-                'last_update': firestore.SERVER_TIMESTAMP
-            })
-        else:
-            stats_ref.set({
-                'date': today,
-                'peak': len(players),
-                'hourly': {str(current_hour): len(players)},
-                'created_at': firestore.SERVER_TIMESTAMP,
-                'last_update': firestore.SERVER_TIMESTAMP
-            })
-        
-        # Check all-time records
-        records_ref = db.collection('stats').document('records')
-        records_doc = records_ref.get()
-        
-        if records_doc.exists:
-            records = records_doc.to_dict()
-            if len(players) > records.get('peak_count', 0):
-                records_ref.update({
-                    'peak_count': len(players),
-                    'peak_date': now.isoformat()
+        # 5. Handle LEFT players
+        for name in left:
+            key = name.lower().strip()
+            existing = players_cache.get(key) or players_cache.get(normalize_name(name))
+            
+            if existing:
+                doc_id, data = existing
+                prev_player = previous_data.get(name, {})
+                session_time = prev_player.get('time', 0)
+                
+                current_total = data.get('total_time_seconds', 0)
+                new_total = current_total + session_time
+                
+                db.collection('players').document(doc_id).update({
+                    'total_time_seconds': new_total,
+                    'last_seen': firestore.SERVER_TIMESTAMP,
+                    'connected_at': firestore.DELETE_FIELD
                 })
-                print(f"    🏆 Nouveau record: {len(players)} joueurs!")
-        else:
-            records_ref.set({
-                'peak_count': len(players),
-                'peak_date': now.isoformat()
-            })
+                writes += 1
+                print(f"          ⬇️ {name} (+{session_time//60}m)")
         
-        return True
-        
-    except Exception as e:
-        print(f"    ⚠️ Erreur: {e}")
+        # 6. Update live status
+        live_players = []
+        for name, t in current_players.items():
+            player_data = {'name': name, 'time': t}
+            if name in previous_data and 'connected_at' in previous_data[name]:
+                player_data['connected_at'] = previous_data[name]['connected_at']
+            elif name in joined:
+                player_data['connected_at'] = now.isoformat()
+            live_players.append(player_data)
         
         db.collection('live').document('status').set({
-            "ok": False,
-            "error": str(e),
-            "count": 0,
-            "players": [],
+            "ok": True,
+            "count": server_data['count'],
+            "players": live_players,
+            "serverName": server_data['server_name'],
+            "map": server_data['map'],
+            "maxPlayers": server_data['max_players'],
             "timestamp": now.isoformat(),
             "updatedAt": now.isoformat()
         })
+        writes += 1
+        
+        # 7. Daily stats - only if new peak
+        today = france_now.strftime('%Y-%m-%d')
+        hour = france_now.hour
+        stats_ref = db.collection('stats').document('daily').collection('days').document(today)
+        
+        try:
+            stats_doc = stats_ref.get()
+            if stats_doc.exists:
+                data = stats_doc.to_dict()
+                hourly = data.get('hourly', {})
+                hour_peak = hourly.get(str(hour), 0)
+                daily_peak = data.get('peak', 0)
+                
+                if server_data['count'] > hour_peak or server_data['count'] > daily_peak:
+                    hourly[str(hour)] = max(hour_peak, server_data['count'])
+                    stats_ref.update({
+                        'peak': max(daily_peak, server_data['count']),
+                        'hourly': hourly,
+                        'last_update': firestore.SERVER_TIMESTAMP
+                    })
+                    writes += 1
+            else:
+                stats_ref.set({
+                    'date': today,
+                    'peak': server_data['count'],
+                    'hourly': {str(hour): server_data['count']},
+                    'created_at': firestore.SERVER_TIMESTAMP
+                })
+                writes += 1
+        except:
+            pass
+        
+        # 8. Records - only if new record
+        try:
+            records_ref = db.collection('stats').document('records')
+            records_doc = records_ref.get()
+            
+            if records_doc.exists:
+                if server_data['count'] > records_doc.to_dict().get('peak_count', 0):
+                    records_ref.update({
+                        'peak_count': server_data['count'],
+                        'peak_date': now.isoformat()
+                    })
+                    writes += 1
+                    print(f"    🏆 Record: {server_data['count']}!")
+            else:
+                records_ref.set({'peak_count': server_data['count'], 'peak_date': now.isoformat()})
+                writes += 1
+        except:
+            pass
+        
+        print(f"       ✅ {writes} writes")
+        return True
+        
+    except Exception as e:
+        print(f"    ❌ Sync error: {e}")
+        try:
+            db.collection('live').document('status').set({
+                "ok": False, "error": str(e), "count": 0, "players": [],
+                "timestamp": now.isoformat(), "updatedAt": now.isoformat()
+            })
+        except:
+            pass
         return False
 
 def main():
     print("=" * 50)
-    print("🎮 GMod Status - GitHub Actions")
-    print(f"   Configuration: {LOOP_COUNT} requêtes, {LOOP_DELAY}s d'intervalle")
+    print("🎮 GMod Status v8.1")
     print("=" * 50)
     
-    # Get Firebase credentials
-    service_account_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
-    
-    if not service_account_json:
-        print("❌ FIREBASE_SERVICE_ACCOUNT non configuré!")
-        sys.exit(1)
-    
-    # Initialize Firebase
     try:
-        cred_dict = json.loads(service_account_json)
-        cred = credentials.Certificate(cred_dict)
-        firebase_admin.initialize_app(cred)
-        db = firestore.client()
-        print("✅ Firebase initialisé")
+        db = init_firebase()
+        print("✅ Firebase OK")
     except Exception as e:
-        print(f"❌ Erreur Firebase: {e}")
+        print(f"❌ Firebase: {e}")
         sys.exit(1)
     
-    # Run queries in a loop
-    success_count = 0
-    for i in range(1, LOOP_COUNT + 1):
-        if query_server(db, i):
-            success_count += 1
-        
-        # Wait before next iteration (except for the last one)
-        if i < LOOP_COUNT:
-            print(f"    ⏳ Attente {LOOP_DELAY}s...")
-            time.sleep(LOOP_DELAY)
+    # Attendre la prochaine minute :00
+    wait_for_next_minute()
     
-    print("\n" + "=" * 50)
-    print(f"✅ Terminé: {success_count}/{LOOP_COUNT} requêtes réussies")
-    print("=" * 50)
+    now = datetime.now(timezone.utc)
+    france_now = get_france_time()
+    
+    print(f"🎮 {france_now.strftime('%H:%M:%S')} - Query {GMOD_HOST}:{GMOD_PORT}")
+    
+    server_data = query_gmod_server(GMOD_HOST, GMOD_PORT)
+    
+    if server_data:
+        print(f"    ✅ {server_data['count']}/{server_data['max_players']} on {server_data['map']}")
+        
+        for p in server_data['players'][:3]:
+            m = p['time'] // 60
+            print(f"       • {p['name']} ({m//60}h{m%60:02d}m)" if m >= 60 else f"       • {p['name']} ({m}m)")
+        if len(server_data['players']) > 3:
+            print(f"       ... +{len(server_data['players']) - 3}")
+        
+        sync_to_firebase(db, server_data, now, france_now)
+    else:
+        print("    ❌ Offline")
+        try:
+            db.collection('live').document('status').set({
+                "ok": False, "error": "Offline", "count": 0, "players": [],
+                "timestamp": now.isoformat(), "updatedAt": now.isoformat()
+            })
+        except:
+            pass
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
