@@ -1,0 +1,27 @@
+name: Keep Alive
+
+# Tous les 50 jours (avant les 60 jours de GitHub)
+on:
+  schedule:
+    - cron: '0 0 1,15 * *'  # Le 1er et 15 de chaque mois
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Update timestamp
+        run: |
+          echo "Last activity: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > .last-run
+          echo "This file is auto-updated to prevent GitHub from disabling scheduled workflows."  >> .last-run
+      
+      - name: Commit changes
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add .last-run
+          git diff --quiet && git diff --staged --quiet || git commit -m "🤖 Keep-alive: $(date -u '+%Y-%m-%d')"
+          git push
