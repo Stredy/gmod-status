@@ -1,258 +1,204 @@
+#!/usr/bin/env python3
 """
-GMod Server Query Script (Python + a2s)
-
-Ce script est exécuté par GitHub Actions toutes les minutes.
-Il query le serveur GMod avec a2s et écrit les résultats dans Firebase.
+GMod Server Status - GitHub Actions
+Queries a GMod server using A2S protocol and syncs to Firebase
 """
 
 import os
 import sys
-import socket
 import json
 from datetime import datetime, timezone
 
+# Install dependencies
 import a2s
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# Configuration
-GMOD_HOST = os.environ.get('GMOD_HOST', '51.91.215.65')
-GMOD_PORT = int(os.environ.get('GMOD_PORT', '27015'))
-
 def format_duration(seconds):
-    """Formate une durée en heures:minutes:secondes."""
-    if seconds < 60:
-        return f"{seconds}s"
+    """Format seconds to human readable duration"""
+    if not seconds or seconds < 60:
+        return "< 1m"
     
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
     
     if hours > 0:
         return f"{hours}h{minutes:02d}m"
-    return f"{minutes}m{secs:02d}s"
-
-def init_firebase():
-    """Initialise Firebase avec les credentials depuis la variable d'environnement."""
-    try:
-        service_account_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT', '{}')
-        service_account = json.loads(service_account_json)
-        
-        if 'project_id' not in service_account:
-            print('❌ FIREBASE_SERVICE_ACCOUNT non configuré')
-            sys.exit(1)
-        
-        cred = credentials.Certificate(service_account)
-        firebase_admin.initialize_app(cred)
-        
-        print('✅ Firebase initialisé')
-        return firestore.client()
-        
-    except Exception as e:
-        print(f'❌ Erreur Firebase: {e}')
-        sys.exit(1)
-
-def query_gmod_server():
-    """Query le serveur GMod avec a2s."""
-    addr = (GMOD_HOST, GMOD_PORT)
-    socket.setdefaulttimeout(5.0)
-    
-    print(f'🎮 Query du serveur {GMOD_HOST}:{GMOD_PORT}...')
-    
-    try:
-        # Récupérer les infos du serveur
-        info = a2s.info(addr)
-        
-        # Récupérer la liste des joueurs
-        players_raw = a2s.players(addr)
-        
-        players = []
-        for p in players_raw:
-            name = getattr(p, 'name', '') or 'Unknown'
-            score = getattr(p, 'score', 0)
-            duration = int(getattr(p, 'duration', 0))
-            
-            # Ignorer les joueurs sans nom ou avec nom vide
-            if name and name.strip() and name != 'Unknown':
-                players.append({
-                    'name': name.strip(),
-                    'score': score,
-                    'time': duration
-                })
-        
-        data = {
-            'ok': True,
-            'serverName': getattr(info, 'server_name', 'Unknown'),
-            'map': getattr(info, 'map_name', 'Unknown'),
-            'game': getattr(info, 'game', 'DarkRP'),
-            'count': len(players),
-            'maxPlayers': getattr(info, 'max_players', 128),
-            'players': players,
-            'ping': 0,
-            'updatedAt': datetime.now(timezone.utc).isoformat()
-        }
-        
-        print(f'✅ Serveur en ligne: {data["count"]}/{data["maxPlayers"]} joueurs sur {data["map"]}')
-        
-        if players:
-            print('   Joueurs:')
-            for p in players:
-                time_str = format_duration(p['time'])
-                print(f'      • {p["name"]} ({time_str})')
-        
-        return data
-        
-    except Exception as e:
-        print(f'❌ Serveur hors ligne ou erreur: {e}')
-        
-        return {
-            'ok': False,
-            'error': str(e),
-            'count': 0,
-            'players': [],
-            'updatedAt': datetime.now(timezone.utc).isoformat()
-        }
-
-def write_to_firebase(db, data):
-    """Écrit les données dans Firebase."""
-    now = datetime.now(timezone.utc)
-    
-    try:
-        # 1. Écrire le status live
-        db.collection('live').document('status').set({
-            **data,
-            'timestamp': firestore.SERVER_TIMESTAMP
-        })
-        
-        print('✅ Status live mis à jour dans Firebase')
-        
-        # 2. Si des joueurs sont en ligne, les enregistrer/mettre à jour
-        if data['ok'] and data['players']:
-            players_ref = db.collection('players')
-            
-            for player in data['players']:
-                name = player['name']
-                if not name or name == 'Unknown':
-                    continue
-                
-                # Chercher si le joueur existe déjà
-                existing = players_ref.where('name', '==', name).limit(1).get()
-                
-                if existing:
-                    # Joueur existant - mettre à jour
-                    doc = existing[0]
-                    existing_data = doc.to_dict()
-                    
-                    doc.reference.update({
-                        'last_seen': firestore.SERVER_TIMESTAMP,
-                        'total_time_seconds': existing_data.get('total_time_seconds', 0) + 60,
-                        'current_session_time': player['time']
-                    })
-                else:
-                    # Nouveau joueur - le créer
-                    import random
-                    import string
-                    random_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
-                    new_id = f'auto_{int(now.timestamp())}_{random_id}'
-                    
-                    players_ref.document(new_id).set({
-                        'name': name,
-                        'steam_id': new_id,
-                        'roles': ['Joueur'],
-                        'ingame_names': [name],
-                        'created_at': firestore.SERVER_TIMESTAMP,
-                        'last_seen': firestore.SERVER_TIMESTAMP,
-                        'total_time_seconds': 60,
-                        'current_session_time': player['time'],
-                        'is_auto_detected': True
-                    })
-                    
-                    print(f'   🆕 Nouveau joueur enregistré: {name}')
-            
-            print(f'✅ {len(data["players"])} joueur(s) mis à jour')
-        
-        # 3. Mettre à jour les stats du jour
-        update_daily_stats(db, data, now)
-        
-    except Exception as e:
-        print(f'❌ Erreur écriture Firebase: {e}')
-
-def update_daily_stats(db, data, now):
-    """Met à jour les statistiques journalières."""
-    if not data['ok']:
-        return
-    
-    date_key = now.strftime('%Y-%m-%d')
-    hour = now.hour
-    
-    try:
-        stats_ref = db.collection('stats').document('daily').collection('days').document(date_key)
-        stats_doc = stats_ref.get()
-        
-        hourly_counts = [0] * 24
-        unique_players = []
-        peak_count = data['count']
-        peak_time = now
-        
-        if stats_doc.exists:
-            existing = stats_doc.to_dict()
-            hourly_counts = existing.get('hourly_counts', [0] * 24)
-            unique_players = existing.get('unique_players', [])
-            
-            if data['count'] > existing.get('peak_count', 0):
-                peak_count = data['count']
-                peak_time = now
-            else:
-                peak_count = existing.get('peak_count', 0)
-                peak_time = existing.get('peak_time', now)
-        
-        # Mettre à jour le max pour cette heure
-        if data['count'] > hourly_counts[hour]:
-            hourly_counts[hour] = data['count']
-        
-        # Ajouter les joueurs uniques
-        player_names = [p['name'] for p in data['players'] if p['name'] and p['name'] != 'Unknown']
-        unique_players = list(set(unique_players + player_names))
-        
-        stats_ref.set({
-            'date': firestore.SERVER_TIMESTAMP,
-            'peak_count': peak_count,
-            'peak_time': peak_time if isinstance(peak_time, datetime) else peak_time,
-            'hourly_counts': hourly_counts,
-            'unique_players': unique_players
-        })
-        
-        # Vérifier le record all-time
-        records_ref = db.collection('stats').document('records')
-        records_doc = records_ref.get()
-        current_record = records_doc.to_dict().get('peak_count', 0) if records_doc.exists else 0
-        
-        if data['count'] > current_record:
-            records_ref.set({
-                'peak_count': data['count'],
-                'peak_date': firestore.SERVER_TIMESTAMP,
-                'peak_players': player_names
-            })
-            
-            print(f'🏆 NOUVEAU RECORD: {data["count"]} joueurs!')
-        
-        print('✅ Stats journalières mises à jour')
-        
-    except Exception as e:
-        print(f'❌ Erreur mise à jour stats: {e}')
+    return f"{minutes}m"
 
 def main():
-    print('═══════════════════════════════════════════')
-    print('🎮 GMod Status - GitHub Actions (Python)')
-    print(f'📅 {datetime.now(timezone.utc).isoformat()}')
-    print('═══════════════════════════════════════════')
+    print("🎮 GMod Status - GitHub Actions")
+    print("=" * 40)
     
-    db = init_firebase()
-    data = query_gmod_server()
-    write_to_firebase(db, data)
+    # Get configuration from environment
+    host = os.environ.get('GMOD_HOST', '51.91.215.65')
+    port = int(os.environ.get('GMOD_PORT', '27015'))
+    service_account_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
     
-    print('')
-    print('✅ Terminé!')
+    if not service_account_json:
+        print("❌ FIREBASE_SERVICE_ACCOUNT non configuré!")
+        print("   Ajoutez le secret dans Settings → Secrets → Actions")
+        sys.exit(1)
+    
+    # Initialize Firebase
+    try:
+        cred_dict = json.loads(service_account_json)
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        print("✅ Firebase initialisé")
+    except Exception as e:
+        print(f"❌ Erreur Firebase: {e}")
+        sys.exit(1)
+    
+    # Query server
+    address = (host, port)
+    print(f"🎮 Query du serveur {host}:{port}...")
+    
+    try:
+        # Get server info
+        info = a2s.info(address, timeout=10)
+        
+        # Get players
+        players_raw = a2s.players(address, timeout=10)
+        
+        # Format players data
+        players = []
+        for p in players_raw:
+            if p.name and p.name.strip():  # Skip empty names
+                players.append({
+                    "name": p.name,
+                    "score": p.score,
+                    "time": int(p.duration)  # Session time in seconds
+                })
+        
+        # Sort by time (longest first)
+        players.sort(key=lambda x: x['time'], reverse=True)
+        
+        print(f"✅ Serveur en ligne: {len(players)}/{info.max_players} joueurs sur {info.map_name}")
+        
+        if players:
+            print("   Joueurs:")
+            for p in players[:10]:  # Show first 10
+                print(f"      • {p['name']} (en jeu depuis {format_duration(p['time'])})")
+            if len(players) > 10:
+                print(f"      ... et {len(players) - 10} autres")
+        
+        # Prepare live status data
+        now = datetime.now(timezone.utc)
+        live_data = {
+            "ok": True,
+            "serverName": info.server_name,
+            "map": info.map_name,
+            "count": len(players),
+            "maxPlayers": info.max_players,
+            "players": players,
+            "timestamp": now.isoformat(),
+            "updatedAt": now.isoformat()
+        }
+        
+        # Update Firebase /live/status
+        db.collection('live').document('status').set(live_data)
+        print("✅ Status live mis à jour dans Firebase")
+        
+        # Update/create players in database
+        updated_count = 0
+        for p in players:
+            # Create a deterministic ID based on name (since we don't have Steam ID from A2S)
+            player_id = f"auto_{p['name'].lower().replace(' ', '_')}"
+            player_ref = db.collection('players').document(player_id)
+            player_doc = player_ref.get()
+            
+            if player_doc.exists:
+                # Update existing player
+                player_data = player_doc.to_dict()
+                current_total = player_data.get('total_time_seconds', 0)
+                
+                player_ref.update({
+                    'last_seen': firestore.SERVER_TIMESTAMP,
+                    'total_time_seconds': current_total + 60,  # Add 1 minute per check
+                    'current_session_time': p['time']
+                })
+            else:
+                # Create new player (auto-detected)
+                player_ref.set({
+                    'name': p['name'],
+                    'steam_id': player_id,
+                    'roles': ['Non scanné'],  # Important: mark as unscanned
+                    'ingame_names': [p['name']],
+                    'created_at': firestore.SERVER_TIMESTAMP,
+                    'last_seen': firestore.SERVER_TIMESTAMP,
+                    'total_time_seconds': p['time'],
+                    'current_session_time': p['time'],
+                    'is_auto_detected': True
+                })
+            
+            updated_count += 1
+        
+        print(f"✅ {updated_count} joueur(s) mis à jour")
+        
+        # Update daily stats
+        today = now.strftime('%Y-%m-%d')
+        stats_ref = db.collection('stats').document('daily').collection('days').document(today)
+        stats_doc = stats_ref.get()
+        
+        current_hour = now.hour
+        
+        if stats_doc.exists:
+            stats_data = stats_doc.to_dict()
+            hourly = stats_data.get('hourly', {})
+            hourly[str(current_hour)] = max(hourly.get(str(current_hour), 0), len(players))
+            
+            stats_ref.update({
+                'peak': max(stats_data.get('peak', 0), len(players)),
+                'hourly': hourly,
+                'last_update': firestore.SERVER_TIMESTAMP
+            })
+        else:
+            stats_ref.set({
+                'date': today,
+                'peak': len(players),
+                'hourly': {str(current_hour): len(players)},
+                'created_at': firestore.SERVER_TIMESTAMP,
+                'last_update': firestore.SERVER_TIMESTAMP
+            })
+        
+        print("✅ Stats journalières mises à jour")
+        
+        # Check all-time records
+        records_ref = db.collection('stats').document('records')
+        records_doc = records_ref.get()
+        
+        if records_doc.exists:
+            records = records_doc.to_dict()
+            if len(players) > records.get('all_time_peak', 0):
+                records_ref.update({
+                    'all_time_peak': len(players),
+                    'all_time_peak_date': now.isoformat()
+                })
+                print(f"🏆 Nouveau record: {len(players)} joueurs!")
+        else:
+            records_ref.set({
+                'all_time_peak': len(players),
+                'all_time_peak_date': now.isoformat()
+            })
+        
+    except Exception as e:
+        print(f"⚠️ Serveur hors ligne ou erreur: {e}")
+        
+        # Update Firebase with offline status
+        now = datetime.now(timezone.utc)
+        db.collection('live').document('status').set({
+            "ok": False,
+            "error": str(e),
+            "count": 0,
+            "players": [],
+            "timestamp": now.isoformat(),
+            "updatedAt": now.isoformat()
+        })
+    
+    print("=" * 40)
+    print("✅ Terminé!")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
