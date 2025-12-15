@@ -10,13 +10,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: '20'
-      - run: npm install
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
       - name: Query GMod server
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           GMOD_HOST: '51.91.215.65'
           GMOD_PORT: '27015'
-        run: node query-server.js
+        run: python query_server.py
