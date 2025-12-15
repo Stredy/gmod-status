@@ -1,0 +1,22 @@
+name: GMod Status 5
+
+on:
+  schedule:
+    - cron: '4/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  query-server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - name: Query GMod server
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          GMOD_HOST: '51.91.215.65'
+          GMOD_PORT: '27015'
+        run: node query-server.js
