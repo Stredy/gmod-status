@@ -14,6 +14,11 @@ import unicodedata
 import requests
 from html.parser import HTMLParser
 from datetime import datetime, timezone, timedelta
+from typing import Optional, List
+
+import a2s
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 # Configuration
 GMOD_HOST = os.environ.get('GMOD_HOST', '51.91.215.65')
