@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-GMod Server Status v14 - PRODUCTION OPTIMIZED
+GMod Server Status v15 - PRODUCTION OPTIMIZED
 - 30 queries per workflow (30 minutes)
 - Cache: players + stats + offline state
 - Workflow every 30 minutes via cron
 - Signal handling for graceful shutdown (saves stats on interruption)
+- Steam profile lookup for new players (auto SteamID + avatar)
 
 With 250 players:
 - Init: 252 reads (once per workflow)
@@ -147,6 +148,246 @@ class SteamAvatarParser(HTMLParser):
             return
         if self.in_inner > 0:
             self.in_inner -= 1
+
+class SteamSearchParser(HTMLParser):
+    """Extrait tous les <a class="searchPersonaName" href="...">TEXT</a> dans l'ordre."""
+    def __init__(self):
+        super().__init__()
+        self.results = []  # [(display_name, href), ...]
+        self._in_target_a = False
+        self._current_href = None
+        self._current_text_parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        attr_dict = dict(attrs)
+        class_attr = attr_dict.get("class", "") or ""
+        classes = set(class_attr.split())
+        if "searchPersonaName" in classes and "href" in attr_dict:
+            self._in_target_a = True
+            self._current_href = attr_dict["href"]
+            self._current_text_parts = []
+
+    def handle_data(self, data):
+        if self._in_target_a:
+            self._current_text_parts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "a" and self._in_target_a:
+            name = "".join(self._current_text_parts).strip()
+            href = self._current_href or ""
+            if name and href:
+                self.results.append((name, href))
+            self._in_target_a = False
+            self._current_href = None
+            self._current_text_parts = []
+
+
+class SteamID64Parser(HTMLParser):
+    """Parse la page XML (?xml=1) et extrait le contenu de <steamID64>...</steamID64>."""
+    def __init__(self):
+        super().__init__()
+        self.steamid64 = None
+        self._in_steamid64 = False
+        self._buf = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "steamid64":
+            self._in_steamid64 = True
+            self._buf = []
+
+    def handle_data(self, data):
+        if self._in_steamid64:
+            self._buf.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "steamid64" and self._in_steamid64:
+            val = "".join(self._buf).strip()
+            if val.isdigit():
+                self.steamid64 = val
+            self._in_steamid64 = False
+            self._buf = []
+
+
+# ============================================
+# Steam Profile Lookup
+# ============================================
+def _extract_html_from_ajax_response(text):
+    """L'endpoint Steam peut renvoyer du JSON avec un champ HTML, ou du HTML direct."""
+    t = text.lstrip()
+    if t.startswith("{"):
+        try:
+            obj = json.loads(text)
+            for key in ("html", "results_html", "searchresults", "data"):
+                if key in obj and isinstance(obj[key], str):
+                    return obj[key]
+        except json.JSONDecodeError:
+            pass
+    return text
+
+
+def _to_xml_url(profile_url):
+    """Ajoute ?xml=1 proprement à une URL de profil Steam."""
+    u = profile_url.strip()
+    if not u:
+        return u
+    if "xml=1" in u:
+        return u
+    if "?" in u:
+        return u + "&xml=1"
+    if u.endswith("/"):
+        return u + "?xml=1"
+    return u + "?xml=1"
+
+
+def _extract_steamid64_from_profiles_url(url):
+    """Extrait le steamID64 d'une URL /profiles/xxxx"""
+    marker = "/profiles/"
+    if marker in url:
+        tail = url.split(marker, 1)[1]
+        digits = ""
+        for ch in tail:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        return digits if len(digits) >= 16 else None
+    return None
+
+
+def steamid64_to_steamid2(steamid64):
+    """Convertit steamID64 -> SteamID2 (legacy): STEAM_0:X:Y"""
+    sid64 = int(steamid64)
+    base = 76561197960265728
+    a = sid64 - base
+    x = a % 2
+    y = (a - x) // 2
+    return f"STEAM_0:{x}:{y}"
+
+
+def resolve_to_steamid64(session, profile_url, timeout=15):
+    """
+    Retourne (steamid64, message)
+    - Si déjà /profiles/xxxx, on extrait xxxx
+    - Sinon (/id/...), on fetch ?xml=1 et on lit <steamID64>
+    """
+    sid = _extract_steamid64_from_profiles_url(profile_url)
+    if sid:
+        return sid, "OK (déjà en steamID64)."
+
+    xml_url = _to_xml_url(profile_url)
+    r = session.get(xml_url, timeout=timeout)
+    r.raise_for_status()
+
+    parser = SteamID64Parser()
+    parser.feed(r.text)
+    if parser.steamid64:
+        return parser.steamid64, "OK (résolu via XML)."
+
+    return None, "Impossible d'extraire steamID64."
+
+
+def find_steam_profile(pseudo, max_pages=3, timeout=10):
+    """
+    Cherche un profil Steam par pseudo (case-sensitive exact match).
+    Règles d'incertitude (retourne None):
+    - Aucun résultat
+    - 1er résultat != pseudo (case-sensitive)
+    - Plusieurs résultats exactement == pseudo (doublon)
+    - Lien trouvé mais steamID64 non extractible (profil privé/bloqué)
+    Retourne (steamid64, steam2, profile_url, avatar_url) ou (None, None, None, None)
+    """
+    pseudo = pseudo.strip()
+    if not pseudo:
+        return None, None, None, None
+
+    try:
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "*/*",
+            "Referer": "https://steamcommunity.com/search/users/",
+        })
+
+        # Get session ID
+        r0 = s.get("https://steamcommunity.com/", timeout=timeout)
+        r0.raise_for_status()
+        sessionid = s.cookies.get("sessionid")
+        if not sessionid:
+            return None, None, None, None
+
+        def fetch_page(page):
+            r = s.get(
+                "https://steamcommunity.com/search/SearchCommunityAjax",
+                params={
+                    "text": pseudo,
+                    "filter": "users",
+                    "sessionid": sessionid,
+                    "steamid_user": "false",
+                    "page": str(page),
+                },
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            html = _extract_html_from_ajax_response(r.text)
+            parser = SteamSearchParser()
+            parser.feed(html)
+            return parser.results
+
+        # Fetch first page
+        p1 = fetch_page(1)
+        if not p1:
+            return None, None, None, None
+
+        first_name, first_href = p1[0]
+        # Case-sensitive exact match required
+        if first_name != pseudo:
+            return None, None, None, None
+
+        # Check for duplicates
+        exact_count = sum(1 for n, _ in p1 if n == pseudo)
+        if exact_count > 1:
+            return None, None, None, None
+
+        for page in range(2, max_pages + 1):
+            try:
+                px = fetch_page(page)
+                if not px:
+                    break
+                exact_count += sum(1 for n, _ in px if n == pseudo)
+                if exact_count > 1:
+                    return None, None, None, None
+            except:
+                break
+
+        # Resolve to steamID64
+        steamid64, msg = resolve_to_steamid64(s, first_href)
+        if not steamid64:
+            return None, None, None, None
+
+        steam2 = steamid64_to_steamid2(steamid64)
+        profile_url = f"https://steamcommunity.com/profiles/{steamid64}"
+        
+        # Try to fetch avatar
+        avatar_url = None
+        try:
+            r = s.get(profile_url + "/?l=english", timeout=timeout)
+            if r.status_code == 200:
+                parser = SteamAvatarParser()
+                parser.feed(r.text)
+                if parser.animated:
+                    avatar_url = parser.animated
+                elif parser.static_candidates:
+                    avatar_url = parser.static_candidates[0]
+        except:
+            pass
+
+        return steamid64, steam2, profile_url, avatar_url
+
+    except Exception as e:
+        return None, None, None, None
+
 
 def fetch_steam_avatar(steamid, verbose=False):
     """Récupère l'URL de l'avatar Steam à partir d'un Steam ID"""
@@ -408,21 +649,59 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                 cache['live_to_doc'][name] = doc_id
                 print(f"          ⬆️ {name}")
             else:
-                key = name.lower().strip()
-                doc_id = f"auto_{key.replace(' ', '_').replace('.', '_')[:50]}"
-                new_player = {
-                    'name': name, 'steam_id': doc_id, 'roles': ['Joueur'],
-                    'ingame_names': [], 'created_at': firestore.SERVER_TIMESTAMP,
-                    'last_seen': firestore.SERVER_TIMESTAMP, 'connected_at': now.isoformat(),
-                    'current_session_start': session_time, 'total_time_seconds': 0,
-                    'session_count': 1, 'is_auto_detected': True
-                }
-                db.collection('players').document(doc_id).set(new_player)
-                writes += 1
-                update_player_cache(doc_id, new_player)
-                # Mapper le nom live au doc_id
-                cache['live_to_doc'][name] = doc_id
-                print(f"          🆕 {name}")
+                # Nouveau joueur - essayer de trouver son profil Steam
+                steamid64, steam2, profile_url, avatar_url = find_steam_profile(name)
+                
+                if steam2:
+                    # Profil Steam trouvé!
+                    # Vérifier si ce SteamID existe déjà (changement de nom)
+                    existing_by_steamid = cache['players'].get(steam2)
+                    
+                    if existing_by_steamid:
+                        # C'est un changement de nom Steam!
+                        doc_id = steam2
+                        update = {
+                            'name': name,  # Nouveau nom Steam
+                            'last_seen': firestore.SERVER_TIMESTAMP,
+                            'current_session_start': session_time
+                        }
+                        db.collection('players').document(doc_id).update(update)
+                        writes += 1
+                        update_player_cache(doc_id, {**existing_by_steamid, **update})
+                        cache['live_to_doc'][name] = doc_id
+                        print(f"          🔄 {name} (changement de nom)")
+                    else:
+                        # Nouveau joueur avec SteamID réel
+                        doc_id = steam2
+                        new_player = {
+                            'name': name, 'steam_id': steam2, 'roles': ['Joueur'],
+                            'ingame_names': [], 'created_at': firestore.SERVER_TIMESTAMP,
+                            'last_seen': firestore.SERVER_TIMESTAMP, 'connected_at': now.isoformat(),
+                            'current_session_start': session_time, 'total_time_seconds': 0,
+                            'session_count': 1, 'is_auto_detected': False,
+                            'avatar_url': avatar_url
+                        }
+                        db.collection('players').document(doc_id).set(new_player)
+                        writes += 1
+                        update_player_cache(doc_id, new_player)
+                        cache['live_to_doc'][name] = doc_id
+                        print(f"          🆕✅ {name} ({steam2})")
+                else:
+                    # Profil Steam non trouvé - fallback auto_xxx
+                    key = name.lower().strip()
+                    doc_id = f"auto_{key.replace(' ', '_').replace('.', '_')[:50]}"
+                    new_player = {
+                        'name': name, 'steam_id': doc_id, 'roles': ['Joueur'],
+                        'ingame_names': [], 'created_at': firestore.SERVER_TIMESTAMP,
+                        'last_seen': firestore.SERVER_TIMESTAMP, 'connected_at': now.isoformat(),
+                        'current_session_start': session_time, 'total_time_seconds': 0,
+                        'session_count': 1, 'is_auto_detected': True
+                    }
+                    db.collection('players').document(doc_id).set(new_player)
+                    writes += 1
+                    update_player_cache(doc_id, new_player)
+                    cache['live_to_doc'][name] = doc_id
+                    print(f"          🆕 {name} (auto)")
         
         # Handle LEFT - need to read live/status to get session times
         if left:
@@ -668,7 +947,7 @@ def main():
     global _db
     
     print("=" * 50)
-    print(f"🎮 GMod Status v14 ({QUERIES_PER_RUN} queries/30min)")
+    print(f"🎮 GMod Status v15 ({QUERIES_PER_RUN} queries/30min)")
     print("=" * 50)
     
     try:
