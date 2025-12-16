@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-GMod Server Status v8.1 - Ultra Optimized for Spark Plan
-- Writes ONLY on changes
-- Avatar checked on JOIN, written only if different
-- Synced to exact minute (:00)
+GMod Server Status v9 - ULTRA SMART Firebase Optimization
+- Writes ONLY when data actually changes
+- Hourly stats: write once per hour, skip if same value
+- Avatars: fetch only if missing, check only on new session
+- Live status: skip write if identical to previous
 """
 
 import os
@@ -113,19 +114,22 @@ def query_gmod_server(host: str, port: int) -> Optional[dict]:
 
 def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime):
     """
-    Ultra-optimized sync - writes only on actual changes
+    ULTRA SMART sync - minimizes Firebase reads/writes
     """
     try:
         current_players = {p['name']: p['time'] for p in server_data['players']}
         current_names = set(current_players.keys())
+        current_count = server_data['count']
         
-        # 1. Get previous state
+        # 1. Get previous state (1 read)
         live_doc = db.collection('live').document('status').get()
         previous_names: Set[str] = set()
         previous_data = {}
+        previous_count = 0
         
         if live_doc.exists:
             prev = live_doc.to_dict()
+            previous_count = prev.get('count', 0)
             for p in prev.get('players', []):
                 previous_names.add(p['name'])
                 previous_data[p['name']] = p
@@ -135,13 +139,20 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
         left = previous_names - current_names
         stayed = current_names & previous_names
         
-        print(f"       📊 +{len(joined)} | -{len(left)} | ={len(stayed)}")
+        # Check if player list is identical (same names AND same count)
+        players_identical = (current_names == previous_names) and (current_count == previous_count)
         
-        # 3. Load player docs ONLY if needed
+        print(f"       📊 {current_count} joueurs | +{len(joined)} | -{len(left)} | ={len(stayed)}")
+        
+        writes = 0
+        reads = 1  # live/status déjà lu
+        
+        # 3. Load player docs ONLY if someone joined or left
         players_cache: Dict[str, tuple] = {}
         
         if joined or left:
             all_players = list(db.collection('players').get())
+            reads += 1
             for doc in all_players:
                 data = doc.to_dict()
                 name = data.get('name', '')
@@ -150,8 +161,6 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                 for ingame in data.get('ingame_names', []):
                     players_cache[ingame.lower().strip()] = (doc.id, data)
                     players_cache[normalize_name(ingame)] = (doc.id, data)
-        
-        writes = 0
         
         # 4. Handle JOINED players
         for name in joined:
@@ -164,35 +173,42 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
             if existing:
                 doc_id, data = existing
                 steam_id = data.get('steam_id', '')
-                current_avatar = data.get('avatar_url')
+                current_avatar = data.get('avatar_url', '')
                 
-                # Toujours vérifier l'avatar à l'arrivée
-                update_needed = False
                 update = {
                     'last_seen': firestore.SERVER_TIMESTAMP,
                     'connected_at': now.isoformat(),
                     'current_session_start': session_time,
                     'session_count': data.get('session_count', 0) + 1
                 }
-                update_needed = True
                 
-                # Vérifier avatar si Steam ID valide
+                # SMART AVATAR LOGIC:
+                # - If has valid Steam ID but NO avatar → fetch avatar
+                # - If has valid Steam ID AND avatar → check if changed (new session = good time to check)
                 if steam_id.startswith('STEAM_'):
-                    new_avatar = fetch_steam_avatar(steam_id)
-                    if new_avatar and new_avatar != current_avatar:
-                        update['avatar_url'] = new_avatar
-                        print(f"          🖼️ Avatar mis à jour: {name}")
+                    if not current_avatar:
+                        # No avatar yet → fetch and add
+                        new_avatar = fetch_steam_avatar(steam_id)
+                        if new_avatar:
+                            update['avatar_url'] = new_avatar
+                            print(f"          🖼️ Avatar ajouté: {name}")
+                    else:
+                        # Has avatar → check if changed (only on new session)
+                        new_avatar = fetch_steam_avatar(steam_id)
+                        if new_avatar and new_avatar != current_avatar:
+                            update['avatar_url'] = new_avatar
+                            print(f"          🖼️ Avatar mis à jour: {name}")
                 
-                # Ajouter aux ingame_names si nécessaire
+                # Add to ingame_names if needed
                 ingame = data.get('ingame_names', [])
                 if name not in ingame and name != data.get('name'):
                     update['ingame_names'] = ingame + [name]
                 
                 db.collection('players').document(doc_id).update(update)
                 writes += 1
-                print(f"          ⬆️ {name}")
+                print(f"          ⬆️ {name} (session #{data.get('session_count', 0) + 1})")
             else:
-                # Nouveau joueur
+                # New auto-detected player (no Steam ID, no avatar possible)
                 doc_id = f"auto_{key.replace(' ', '_').replace('.', '_')[:50]}"
                 db.collection('players').document(doc_id).set({
                     'name': name,
@@ -208,157 +224,187 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                     'is_auto_detected': True
                 })
                 writes += 1
-                print(f"          ➕ {name}")
+                print(f"          🆕 {name} (auto)")
         
-        # 5. Handle LEFT players
+        # 5. Handle LEFT players - add session time
         for name in left:
             key = name.lower().strip()
-            existing = players_cache.get(key) or players_cache.get(normalize_name(name))
+            key_norm = normalize_name(name)
+            existing = players_cache.get(key) or players_cache.get(key_norm)
             
             if existing:
                 doc_id, data = existing
-                prev_player = previous_data.get(name, {})
-                session_time = prev_player.get('time', 0)
-                
+                prev_session = previous_data.get(name, {}).get('time', 0)
                 current_total = data.get('total_time_seconds', 0)
-                new_total = current_total + session_time
+                new_total = current_total + prev_session
                 
                 db.collection('players').document(doc_id).update({
                     'total_time_seconds': new_total,
                     'last_seen': firestore.SERVER_TIMESTAMP,
-                    'connected_at': firestore.DELETE_FIELD
+                    'current_session_start': None
                 })
                 writes += 1
-                print(f"          ⬇️ {name} (+{session_time//60}m)")
+                
+                mins = prev_session // 60
+                print(f"          👋 {name} (+{mins}min, total: {new_total // 3600}h)")
         
-        # 6. Update live status
-        live_players = []
-        for name, t in current_players.items():
-            player_data = {'name': name, 'time': t}
-            if name in previous_data and 'connected_at' in previous_data[name]:
-                player_data['connected_at'] = previous_data[name]['connected_at']
-            elif name in joined:
-                player_data['connected_at'] = now.isoformat()
-            live_players.append(player_data)
+        # 6. SMART Live status update - ONLY if something changed
+        if not players_identical:
+            db.collection('live').document('status').set({
+                'ok': True,
+                'count': current_count,
+                'max': server_data['max_players'],
+                'map': server_data['map'],
+                'server': server_data['server_name'],
+                'players': server_data['players'],
+                'timestamp': now.isoformat(),
+                'updatedAt': now.isoformat()
+            })
+            writes += 1
+            print(f"       ✏️ Live status mis à jour")
+        else:
+            print(f"       ⏭️ Live status identique, pas d'écriture")
         
-        db.collection('live').document('status').set({
-            "ok": True,
-            "count": server_data['count'],
-            "players": live_players,
-            "serverName": server_data['server_name'],
-            "map": server_data['map'],
-            "maxPlayers": server_data['max_players'],
-            "timestamp": now.isoformat(),
-            "updatedAt": now.isoformat()
-        })
-        writes += 1
-        
-        # 7. Daily stats - only if new peak
+        # 7. SMART Daily stats - only write if value changed for this hour
         today = france_now.strftime('%Y-%m-%d')
         hour = france_now.hour
         stats_ref = db.collection('stats').document('daily').collection('days').document(today)
         
         try:
             stats_doc = stats_ref.get()
+            reads += 1
+            
             if stats_doc.exists:
                 data = stats_doc.to_dict()
                 hourly = data.get('hourly', {})
-                hour_peak = hourly.get(str(hour), 0)
+                hour_value = hourly.get(str(hour), -1)  # -1 means not set
                 daily_peak = data.get('peak', 0)
                 
-                if server_data['count'] > hour_peak or server_data['count'] > daily_peak:
-                    hourly[str(hour)] = max(hour_peak, server_data['count'])
+                # Only write if:
+                # - Hour not yet recorded (hour_value == -1)
+                # - OR new value is higher (new peak)
+                if hour_value == -1 or current_count > hour_value:
+                    hourly[str(hour)] = max(hour_value if hour_value >= 0 else 0, current_count)
+                    new_peak = max(daily_peak, current_count)
+                    
                     stats_ref.update({
-                        'peak': max(daily_peak, server_data['count']),
+                        'peak': new_peak,
                         'hourly': hourly,
                         'last_update': firestore.SERVER_TIMESTAMP
                     })
                     writes += 1
+                    print(f"       📈 Stats {today} H{hour}: {current_count} joueurs")
+                else:
+                    print(f"       ⏭️ Stats H{hour} déjà à {hour_value}, pas d'écriture")
             else:
+                # First entry for this day
                 stats_ref.set({
                     'date': today,
-                    'peak': server_data['count'],
-                    'hourly': {str(hour): server_data['count']},
+                    'peak': current_count,
+                    'hourly': {str(hour): current_count},
                     'created_at': firestore.SERVER_TIMESTAMP
                 })
                 writes += 1
-        except:
-            pass
+                print(f"       📈 Stats {today} créées (H{hour}: {current_count})")
+        except Exception as e:
+            print(f"       ⚠️ Stats error: {e}")
         
         # 8. Records - only if new record
         try:
             records_ref = db.collection('stats').document('records')
             records_doc = records_ref.get()
+            reads += 1
             
             if records_doc.exists:
-                if server_data['count'] > records_doc.to_dict().get('peak_count', 0):
+                if current_count > records_doc.to_dict().get('peak_count', 0):
                     records_ref.update({
-                        'peak_count': server_data['count'],
+                        'peak_count': current_count,
                         'peak_date': now.isoformat()
                     })
                     writes += 1
-                    print(f"    🏆 Record: {server_data['count']}!")
+                    print(f"       🏆 Nouveau record: {current_count}!")
             else:
-                records_ref.set({'peak_count': server_data['count'], 'peak_date': now.isoformat()})
+                records_ref.set({'peak_count': current_count, 'peak_date': now.isoformat()})
                 writes += 1
         except:
             pass
         
-        print(f"       ✅ {writes} writes")
+        print(f"       ✅ {writes} writes / {reads} reads")
         return True
         
     except Exception as e:
         print(f"    ❌ Sync error: {e}")
-        try:
-            db.collection('live').document('status').set({
-                "ok": False, "error": str(e), "count": 0, "players": [],
-                "timestamp": now.isoformat(), "updatedAt": now.isoformat()
-            })
-        except:
-            pass
+        import traceback
+        traceback.print_exc()
         return False
+
+def mark_offline(db):
+    """Marquer le serveur hors ligne - SMART: skip if already offline"""
+    try:
+        now = datetime.now(timezone.utc)
+        
+        # Check current state first
+        live_doc = db.collection('live').document('status').get()
+        if live_doc.exists:
+            current = live_doc.to_dict()
+            if current.get('ok') == False and current.get('count', 0) == 0:
+                # Already marked as offline, skip write
+                print(f"       ⏭️ Déjà hors ligne, pas d'écriture")
+                return
+        
+        db.collection('live').document('status').set({
+            'ok': False,
+            'count': 0,
+            'players': [],
+            'timestamp': now.isoformat(),
+            'updatedAt': now.isoformat()
+        })
+        print(f"       ⚠️ Serveur marqué hors ligne (1 write)")
+    except Exception as e:
+        print(f"    ❌ Offline error: {e}")
 
 def main():
     print("=" * 50)
-    print("🎮 GMod Status v8.1")
+    print("🎮 GMod Status v9 - ULTRA SMART")
     print("=" * 50)
     
+    # Init
     try:
         db = init_firebase()
         print("✅ Firebase OK")
     except Exception as e:
-        print(f"❌ Firebase: {e}")
+        print(f"❌ Firebase error: {e}")
         sys.exit(1)
     
-    # Attendre la prochaine minute :00
+    # Wait for minute sync
     wait_for_next_minute()
     
-    now = datetime.now(timezone.utc)
-    france_now = get_france_time()
-    
-    print(f"🎮 {france_now.strftime('%H:%M:%S')} - Query {GMOD_HOST}:{GMOD_PORT}")
-    
-    server_data = query_gmod_server(GMOD_HOST, GMOD_PORT)
-    
-    if server_data:
-        print(f"    ✅ {server_data['count']}/{server_data['max_players']} on {server_data['map']}")
+    # Main loop
+    iteration = 0
+    while True:
+        iteration += 1
+        now = datetime.now(timezone.utc)
+        france_now = get_france_time()
         
-        for p in server_data['players'][:3]:
-            m = p['time'] // 60
-            print(f"       • {p['name']} ({m//60}h{m%60:02d}m)" if m >= 60 else f"       • {p['name']} ({m}m)")
-        if len(server_data['players']) > 3:
-            print(f"       ... +{len(server_data['players']) - 3}")
+        print(f"\n[{iteration}] 🕐 {france_now.strftime('%H:%M:%S')}")
         
-        sync_to_firebase(db, server_data, now, france_now)
-    else:
-        print("    ❌ Offline")
-        try:
-            db.collection('live').document('status').set({
-                "ok": False, "error": "Offline", "count": 0, "players": [],
-                "timestamp": now.isoformat(), "updatedAt": now.isoformat()
-            })
-        except:
-            pass
+        # Query server
+        server_data = query_gmod_server(GMOD_HOST, GMOD_PORT)
+        
+        if server_data:
+            print(f"    ✅ {server_data['count']}/{server_data['max_players']} on {server_data['map']}")
+            sync_to_firebase(db, server_data, now, france_now)
+        else:
+            print(f"    ❌ Serveur inaccessible")
+            mark_offline(db)
+        
+        # Next iteration
+        if iteration >= 55:  # ~55 minutes max
+            print("\n🏁 Fin du workflow")
+            break
+        
+        # Wait exactly 60 seconds
+        time.sleep(60)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
