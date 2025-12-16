@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-GMod Server Status v12 - PRODUCTION OPTIMIZED
+GMod Server Status v14 - PRODUCTION OPTIMIZED
 - 30 queries per workflow (30 minutes)
 - Cache: players + stats + offline state
 - Workflow every 30 minutes via cron
+- Signal handling for graceful shutdown (saves stats on interruption)
 
 With 250 players:
 - Init: 252 reads (once per workflow)
@@ -18,6 +19,7 @@ import sys
 import json
 import re
 import time
+import signal
 import unicodedata
 import requests
 from datetime import datetime, timezone, timedelta
@@ -31,6 +33,9 @@ from firebase_admin import credentials, firestore
 GMOD_HOST = os.environ.get('GMOD_HOST', '51.91.215.65')
 GMOD_PORT = int(os.environ.get('GMOD_PORT', '27015'))
 QUERIES_PER_RUN = 30
+
+# Global db reference for signal handler
+_db = None
 
 # ============================================
 # Memory Cache
@@ -578,13 +583,41 @@ def mark_offline(db):
     except Exception as e:
         print(f"    ❌ Offline: {e}")
 
+# ============================================
+# Signal Handling (graceful shutdown)
+# ============================================
+def graceful_shutdown(signum, frame):
+    """Handle termination signal - save player stats before exit"""
+    global _db, cache
+    signal_name = signal.Signals(signum).name
+    print(f"\n⚠️ Signal {signal_name} reçu - sauvegarde en cours...")
+    
+    if _db and cache.get('prev_names'):
+        try:
+            mark_offline(_db)
+            print("✅ Stats sauvegardées avant arrêt")
+        except Exception as e:
+            print(f"❌ Erreur sauvegarde: {e}")
+    
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, graceful_shutdown)
+signal.signal(signal.SIGINT, graceful_shutdown)
+
+# ============================================
+# Main
+# ============================================
 def main():
+    global _db
+    
     print("=" * 50)
-    print(f"🎮 GMod Status v12 ({QUERIES_PER_RUN} queries/30min)")
+    print(f"🎮 GMod Status v14 ({QUERIES_PER_RUN} queries/30min)")
     print("=" * 50)
     
     try:
         db = init_firebase()
+        _db = db  # For signal handler
         print("✅ Firebase OK")
     except Exception as e:
         print(f"❌ Firebase: {e}")
