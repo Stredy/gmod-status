@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-GMod Server Status v11 - Optimized for GitHub Actions
-- Runs 10 queries per workflow execution (~10 minutes total)
-- Cache loaded ONCE at start, reused for all 10 queries
-- Workflow runs every 10 minutes via cron
+GMod Server Status v12 - PRODUCTION OPTIMIZED
+- 30 queries per workflow (30 minutes)
+- Cache: players + stats + offline state
+- Workflow every 30 minutes via cron
 
-With 200 players:
-- Reads per workflow: ~202 (init) + 10 (live/status) = ~212
-- Reads per hour: 6 workflows × 212 = ~1,272
-- Reads per day: ~30,528 (well under 50k free quota)
+With 250 players:
+- Init: 252 reads (once per workflow)
+- Queries: 30 reads (1 per minute)
+- Total: 282 reads per workflow
+- 2 workflows/hour = 564 reads/hour
+- 24h = 13,536 reads/day (27% of quota)
 """
 
 import os
@@ -27,18 +29,26 @@ from firebase_admin import credentials, firestore
 
 GMOD_HOST = os.environ.get('GMOD_HOST', '51.91.215.65')
 GMOD_PORT = int(os.environ.get('GMOD_PORT', '27015'))
-QUERIES_PER_RUN = 10  # Number of queries per workflow execution (1 per minute)
+QUERIES_PER_RUN = 30
 
 # ============================================
-# Memory Cache - Loaded once per workflow run
+# Memory Cache
 # ============================================
 cache = {
+    # Stats cache
     'hourly_stats': {},
     'daily_peak': 0,
     'record_peak': 0,
     'today_date': None,
+    # Players cache
     'players': {},
     'players_by_name': {},
+    # Offline state cache (NEW!)
+    'is_offline': False,
+    'offline_since': None,
+    # Previous live state (for comparison)
+    'prev_names': set(),
+    'prev_count': 0,
 }
 
 def get_france_time():
@@ -73,7 +83,6 @@ def fetch_steam_avatar(steamid):
         steam64 = steam2_to_steam64(steamid)
         if not steam64:
             return None
-        
         response = requests.get(
             f"https://steamcommunity.com/profiles/{steam64}",
             timeout=5,
@@ -81,7 +90,6 @@ def fetch_steam_avatar(steamid):
         )
         if response.status_code != 200:
             return None
-        
         for pattern in [r'<link rel="image_src" href="([^"]+)"', r'<meta property="og:image" content="([^"]+)"']:
             match = re.search(pattern, response.text)
             if match and 'steamcommunity.com' in match.group(1):
@@ -93,11 +101,9 @@ def fetch_steam_avatar(steamid):
 def init_firebase():
     if firebase_admin._apps:
         return firestore.client()
-    
     service_account_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
     if not service_account_json:
         raise ValueError("FIREBASE_SERVICE_ACCOUNT not set")
-    
     cred = credentials.Certificate(json.loads(service_account_json))
     firebase_admin.initialize_app(cred)
     return firestore.client()
@@ -107,15 +113,10 @@ def query_gmod_server(host: str, port: int) -> Optional[dict]:
         address = (host, port)
         info = a2s.info(address, timeout=10)
         players = a2s.players(address, timeout=10)
-        
         player_list = []
         for p in sorted(players, key=lambda x: x.duration, reverse=True):
             if p.name and p.name.strip():
-                player_list.append({
-                    'name': p.name.strip(),
-                    'time': int(p.duration)
-                })
-        
+                player_list.append({'name': p.name.strip(), 'time': int(p.duration)})
         return {
             'server_name': info.server_name,
             'map': info.map_name,
@@ -124,18 +125,16 @@ def query_gmod_server(host: str, port: int) -> Optional[dict]:
             'count': len(player_list)
         }
     except Exception as e:
-        print(f"    ❌ Server error: {e}")
+        print(f"    ❌ Serveur: {e}")
         return None
 
 def init_cache(db, france_now):
     """Load all caches once at workflow start"""
     global cache
     reads = 0
-    
     today = france_now.strftime('%Y-%m-%d')
-    hour = france_now.hour
     
-    # 1. Load today's stats
+    # 1. Stats du jour
     try:
         stats_doc = db.collection('stats').document('daily').collection('days').document(today).get()
         reads += 1
@@ -146,7 +145,7 @@ def init_cache(db, france_now):
     except:
         pass
     
-    # 2. Load record
+    # 2. Record
     try:
         records_doc = db.collection('stats').document('records').get()
         reads += 1
@@ -155,7 +154,7 @@ def init_cache(db, france_now):
     except:
         pass
     
-    # 3. Load ALL players
+    # 3. Tous les joueurs
     try:
         all_players = db.collection('players').get()
         player_count = 0
@@ -163,32 +162,39 @@ def init_cache(db, france_now):
             player_count += 1
             data = doc.to_dict()
             doc_id = doc.id
-            
             cache['players'][doc_id] = data
-            
             name = data.get('name', '')
             cache['players_by_name'][name.lower().strip()] = doc_id
             cache['players_by_name'][normalize_name(name)] = doc_id
-            
             for ingame in data.get('ingame_names', []):
                 cache['players_by_name'][ingame.lower().strip()] = doc_id
                 cache['players_by_name'][normalize_name(ingame)] = doc_id
-        
         reads += player_count
-        print(f"    👥 {player_count} joueurs en cache")
+        print(f"    👥 {player_count} joueurs")
     except Exception as e:
         print(f"    ⚠️ Erreur joueurs: {e}")
     
-    cache['today_date'] = today
+    # 4. État live actuel (pour initialiser prev_names)
+    try:
+        live_doc = db.collection('live').document('status').get()
+        reads += 1
+        if live_doc.exists:
+            data = live_doc.to_dict()
+            cache['is_offline'] = not data.get('ok', True)
+            cache['prev_count'] = data.get('count', 0)
+            for p in data.get('players', []):
+                cache['prev_names'].add(p['name'])
+    except:
+        pass
     
-    print(f"    📦 H{hour}={cache['hourly_stats'].get(hour, 'new')}, peak={cache['daily_peak']}, record={cache['record_peak']}")
+    cache['today_date'] = today
+    print(f"    📦 Stats H{france_now.hour}, peak={cache['daily_peak']}, record={cache['record_peak']}")
     print(f"    📊 Init: {reads} reads")
     return reads
 
-def find_player_in_cache(name):
+def find_player(name):
     key = name.lower().strip()
-    key_norm = normalize_name(name)
-    doc_id = cache['players_by_name'].get(key) or cache['players_by_name'].get(key_norm)
+    doc_id = cache['players_by_name'].get(key) or cache['players_by_name'].get(normalize_name(name))
     if doc_id and doc_id in cache['players']:
         return (doc_id, cache['players'][doc_id])
     return None
@@ -199,18 +205,16 @@ def update_player_cache(doc_id, data):
         cache['players'][doc_id].update(data)
     else:
         cache['players'][doc_id] = data
-    
     name = data.get('name', '')
     if name:
         cache['players_by_name'][name.lower().strip()] = doc_id
         cache['players_by_name'][normalize_name(name)] = doc_id
-    
     for ingame in data.get('ingame_names', []):
         cache['players_by_name'][ingame.lower().strip()] = doc_id
         cache['players_by_name'][normalize_name(ingame)] = doc_id
 
 def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime):
-    """Sync with Firebase - uses cache, minimal reads"""
+    """Sync with Firebase using cache - ZERO unnecessary reads"""
     global cache
     
     try:
@@ -223,29 +227,21 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
         writes = 0
         reads = 0
         
-        # Check day change
+        # Reset offline state (server is responding)
+        cache['is_offline'] = False
+        
+        # Day change?
         if cache['today_date'] != today:
             print(f"       🌅 Nouveau jour")
             cache['hourly_stats'] = {}
             cache['daily_peak'] = 0
             cache['today_date'] = today
         
-        # 1. Read live/status (only read per sync!)
-        live_doc = db.collection('live').document('status').get()
-        reads += 1
+        # Use cached previous state instead of reading!
+        previous_names = cache['prev_names']
+        previous_count = cache['prev_count']
         
-        previous_names: Set[str] = set()
-        previous_data = {}
-        previous_count = 0
-        
-        if live_doc.exists:
-            prev = live_doc.to_dict()
-            previous_count = prev.get('count', 0)
-            for p in prev.get('players', []):
-                previous_names.add(p['name'])
-                previous_data[p['name']] = p
-        
-        # 2. Detect changes
+        # Detect changes
         joined = current_names - previous_names
         left = previous_names - current_names
         stayed = current_names & previous_names
@@ -253,10 +249,10 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
         
         print(f"       📊 {current_count} | +{len(joined)} -{len(left)} ={len(stayed)}")
         
-        # 3. Handle JOINED (use cache!)
+        # Handle JOINED
         for name in joined:
             session_time = current_players[name]
-            existing = find_player_in_cache(name)
+            existing = find_player(name)
             
             if existing:
                 doc_id, data = existing
@@ -270,6 +266,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                     'session_count': data.get('session_count', 0) + 1
                 }
                 
+                # Avatar: fetch only if missing or on new session
                 if steam_id.startswith('STEAM_'):
                     if not current_avatar:
                         new_avatar = fetch_steam_avatar(steam_id)
@@ -294,81 +291,79 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                 key = name.lower().strip()
                 doc_id = f"auto_{key.replace(' ', '_').replace('.', '_')[:50]}"
                 new_player = {
-                    'name': name,
-                    'steam_id': doc_id,
-                    'roles': ['Joueur'],
-                    'ingame_names': [],
-                    'created_at': firestore.SERVER_TIMESTAMP,
-                    'last_seen': firestore.SERVER_TIMESTAMP,
-                    'connected_at': now.isoformat(),
-                    'current_session_start': session_time,
-                    'total_time_seconds': 0,
-                    'session_count': 1,
-                    'is_auto_detected': True
+                    'name': name, 'steam_id': doc_id, 'roles': ['Joueur'],
+                    'ingame_names': [], 'created_at': firestore.SERVER_TIMESTAMP,
+                    'last_seen': firestore.SERVER_TIMESTAMP, 'connected_at': now.isoformat(),
+                    'current_session_start': session_time, 'total_time_seconds': 0,
+                    'session_count': 1, 'is_auto_detected': True
                 }
                 db.collection('players').document(doc_id).set(new_player)
                 writes += 1
                 update_player_cache(doc_id, new_player)
                 print(f"          🆕 {name}")
         
-        # 4. Handle LEFT (use cache!)
-        for name in left:
-            existing = find_player_in_cache(name)
-            if existing:
-                doc_id, data = existing
-                prev_session = previous_data.get(name, {}).get('time', 0)
-                new_total = data.get('total_time_seconds', 0) + prev_session
-                
-                update = {
-                    'total_time_seconds': new_total,
-                    'last_seen': firestore.SERVER_TIMESTAMP,
-                    'current_session_start': None
-                }
-                db.collection('players').document(doc_id).update(update)
-                writes += 1
-                update_player_cache(doc_id, {**data, **update})
-                print(f"          👋 {name} (+{prev_session//60}min)")
+        # Handle LEFT - need to read live/status to get session times
+        if left:
+            # Only read if someone left (to get their session time)
+            live_doc = db.collection('live').document('status').get()
+            reads += 1
+            prev_data = {}
+            if live_doc.exists:
+                for p in live_doc.to_dict().get('players', []):
+                    prev_data[p['name']] = p
+            
+            for name in left:
+                existing = find_player(name)
+                if existing:
+                    doc_id, data = existing
+                    prev_session = prev_data.get(name, {}).get('time', 0)
+                    new_total = data.get('total_time_seconds', 0) + prev_session
+                    update = {
+                        'total_time_seconds': new_total,
+                        'last_seen': firestore.SERVER_TIMESTAMP,
+                        'current_session_start': None
+                    }
+                    db.collection('players').document(doc_id).update(update)
+                    writes += 1
+                    update_player_cache(doc_id, {**data, **update})
+                    print(f"          👋 {name} (+{prev_session//60}min)")
         
-        # 5. Live status
+        # Live status - only if changed
         if not players_identical:
             db.collection('live').document('status').set({
-                'ok': True,
-                'count': current_count,
-                'max': server_data['max_players'],
-                'map': server_data['map'],
-                'server': server_data['server_name'],
-                'players': server_data['players'],
-                'timestamp': now.isoformat(),
-                'updatedAt': now.isoformat()
+                'ok': True, 'count': current_count,
+                'max': server_data['max_players'], 'map': server_data['map'],
+                'server': server_data['server_name'], 'players': server_data['players'],
+                'timestamp': now.isoformat(), 'updatedAt': now.isoformat()
             })
             writes += 1
         else:
             print(f"       ⏭️ Live identique")
         
-        # 6. Stats (use cache!)
-        cached_hour_value = cache['hourly_stats'].get(hour, -1)
-        if cached_hour_value == -1 or current_count > cached_hour_value:
-            cache['hourly_stats'][hour] = max(cached_hour_value if cached_hour_value >= 0 else 0, current_count)
+        # Update cache for next iteration
+        cache['prev_names'] = current_names.copy()
+        cache['prev_count'] = current_count
+        
+        # Stats (use cache)
+        cached_hour = cache['hourly_stats'].get(hour, -1)
+        if cached_hour == -1 or current_count > cached_hour:
+            cache['hourly_stats'][hour] = max(cached_hour if cached_hour >= 0 else 0, current_count)
             cache['daily_peak'] = max(cache['daily_peak'], current_count)
-            
-            hourly_for_fb = {str(k): v for k, v in cache['hourly_stats'].items()}
+            hourly_fb = {str(k): v for k, v in cache['hourly_stats'].items()}
             db.collection('stats').document('daily').collection('days').document(today).set({
-                'date': today,
-                'peak': cache['daily_peak'],
-                'hourly': hourly_for_fb,
-                'last_update': firestore.SERVER_TIMESTAMP
+                'date': today, 'peak': cache['daily_peak'],
+                'hourly': hourly_fb, 'last_update': firestore.SERVER_TIMESTAMP
             }, merge=True)
             writes += 1
             print(f"       📈 H{hour}: {current_count}")
         else:
-            print(f"       ⏭️ H{hour} cache: {cached_hour_value}")
+            print(f"       ⏭️ H{hour} cache: {cached_hour}")
         
-        # 7. Records (use cache!)
+        # Records (use cache)
         if current_count > cache['record_peak']:
             cache['record_peak'] = current_count
             db.collection('stats').document('records').set({
-                'peak_count': current_count,
-                'peak_date': now.isoformat()
+                'peak_count': current_count, 'peak_date': now.isoformat()
             })
             writes += 1
             print(f"       🏆 Record: {current_count}!")
@@ -377,35 +372,41 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
         return True
         
     except Exception as e:
-        print(f"    ❌ Sync error: {e}")
+        print(f"    ❌ Sync: {e}")
         import traceback
         traceback.print_exc()
         return False
 
 def mark_offline(db):
+    """Mark server offline - uses cache to avoid reads"""
+    global cache
+    
+    # Already offline in cache? Skip everything!
+    if cache['is_offline']:
+        print(f"       ⏭️ Déjà offline (cache)")
+        return
+    
     try:
         now = datetime.now(timezone.utc)
-        live_doc = db.collection('live').document('status').get()
-        if live_doc.exists:
-            current = live_doc.to_dict()
-            if current.get('ok') == False:
-                print(f"       ⏭️ Déjà offline")
-                return
         
+        # Mark in Firebase
         db.collection('live').document('status').set({
-            'ok': False,
-            'count': 0,
-            'players': [],
-            'timestamp': now.isoformat(),
-            'updatedAt': now.isoformat()
+            'ok': False, 'count': 0, 'players': [],
+            'timestamp': now.isoformat(), 'updatedAt': now.isoformat()
         })
-        print(f"       ⚠️ Offline")
+        
+        # Update cache
+        cache['is_offline'] = True
+        cache['prev_names'] = set()
+        cache['prev_count'] = 0
+        
+        print(f"       ⚠️ Offline (1W/0R)")
     except Exception as e:
-        print(f"    ❌ Offline error: {e}")
+        print(f"    ❌ Offline: {e}")
 
 def main():
     print("=" * 50)
-    print(f"🎮 GMod Status v11 ({QUERIES_PER_RUN} queries)")
+    print(f"🎮 GMod Status v12 ({QUERIES_PER_RUN} queries/30min)")
     print("=" * 50)
     
     try:
@@ -415,15 +416,11 @@ def main():
         print(f"❌ Firebase: {e}")
         sys.exit(1)
     
-    # Wait for next minute
     wait_for_next_minute()
     
-    # Init cache ONCE
     france_now = get_france_time()
-    total_reads = init_cache(db, france_now)
-    total_writes = 0
+    init_cache(db, france_now)
     
-    # Run queries
     for i in range(QUERIES_PER_RUN):
         now = datetime.now(timezone.utc)
         france_now = get_france_time()
@@ -436,10 +433,8 @@ def main():
             print(f"    ✅ {server_data['count']}/{server_data['max_players']} on {server_data['map']}")
             sync_to_firebase(db, server_data, now, france_now)
         else:
-            print(f"    ❌ Serveur inaccessible")
             mark_offline(db)
         
-        # Wait 1 minute between queries (except last)
         if i < QUERIES_PER_RUN - 1:
             time.sleep(60)
     

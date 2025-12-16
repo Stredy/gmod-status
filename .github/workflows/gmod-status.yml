@@ -2,8 +2,8 @@ name: GMod Status Monitor
 
 on:
   schedule:
-    # Toutes les 10 minutes
-    - cron: '*/10 * * * *'
+    # Toutes les 30 minutes (0 et 30 de chaque heure)
+    - cron: '0,30 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -16,7 +16,7 @@ env:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 35
     
     steps:
       - uses: actions/checkout@v4
@@ -29,9 +29,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       
-      # UN SEUL step qui fait 10 queries avec le cache partagé
-      - name: Monitor Server
-        timeout-minutes: 11
+      - name: Monitor Server (30 queries)
+        timeout-minutes: 32
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
           GMOD_HOST: '51.91.215.65'
