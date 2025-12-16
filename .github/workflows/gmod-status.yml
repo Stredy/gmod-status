@@ -2,13 +2,14 @@ name: GMod Status Monitor
 
 on:
   schedule:
-    # Toutes les 30 minutes - UN SEUL cron (pas de backup qui annule!)
-    - cron: '0,30 * * * *'
+    # Heures décalées pour éviter les pics de charge GitHub (pas :00/:30)
+    - cron: '24,54 * * * *'    # Principal: :24 et :54
+    - cron: '26,56 * * * *'    # Backup: 2 min après (si GitHub a du retard)
   workflow_dispatch:
 
 concurrency:
   group: gmod-monitor
-  # NE PAS annuler le workflow en cours - le nouveau attend
+  # IMPORTANT: NE PAS annuler - le backup attend son tour
   cancel-in-progress: false
 
 env:

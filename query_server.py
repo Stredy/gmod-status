@@ -587,23 +587,79 @@ def mark_offline(db):
 # Signal Handling (graceful shutdown)
 # ============================================
 def graceful_shutdown(signum, frame):
-    """Handle termination signal - save player stats before exit"""
+    """Handle termination signal - save player stats and release lock before exit"""
     global _db, cache
     signal_name = signal.Signals(signum).name
     print(f"\n⚠️ Signal {signal_name} reçu - sauvegarde en cours...")
     
-    if _db and cache.get('prev_names'):
+    if _db:
+        # Save player stats
+        if cache.get('prev_names'):
+            try:
+                mark_offline(_db)
+                print("✅ Stats sauvegardées avant arrêt")
+            except Exception as e:
+                print(f"❌ Erreur sauvegarde: {e}")
+        
+        # Release lock
         try:
-            mark_offline(_db)
-            print("✅ Stats sauvegardées avant arrêt")
+            _db.collection('system').document('workflow_lock').delete()
+            print("🔓 Lock libéré")
         except Exception as e:
-            print(f"❌ Erreur sauvegarde: {e}")
+            print(f"⚠️ Erreur release lock: {e}")
     
     sys.exit(0)
 
 # Register signal handlers
 signal.signal(signal.SIGTERM, graceful_shutdown)
 signal.signal(signal.SIGINT, graceful_shutdown)
+
+# ============================================
+# Workflow Lock (prevent parallel execution)
+# ============================================
+def acquire_lock(db):
+    """Try to acquire workflow lock. Returns True if acquired, False if another workflow is running."""
+    lock_ref = db.collection('system').document('workflow_lock')
+    now = datetime.now(timezone.utc)
+    
+    try:
+        lock_doc = lock_ref.get()
+        if lock_doc.exists:
+            lock_data = lock_doc.to_dict()
+            lock_time = lock_data.get('started_at')
+            if lock_time:
+                # Convert Firestore timestamp to datetime
+                if hasattr(lock_time, 'timestamp'):
+                    lock_time = datetime.fromtimestamp(lock_time.timestamp(), tz=timezone.utc)
+                
+                # Lock is valid if less than 35 minutes old
+                age_minutes = (now - lock_time).total_seconds() / 60
+                if age_minutes < 35:
+                    print(f"    🔒 Autre workflow en cours depuis {age_minutes:.1f}min - abandon")
+                    return False
+                else:
+                    print(f"    ⚠️ Lock expiré ({age_minutes:.1f}min) - reprise")
+        
+        # Acquire lock
+        lock_ref.set({
+            'started_at': firestore.SERVER_TIMESTAMP,
+            'pid': os.getpid(),
+            'status': 'running'
+        })
+        print("    🔓 Lock acquis")
+        return True
+        
+    except Exception as e:
+        print(f"    ⚠️ Erreur lock: {e} - continuation")
+        return True  # Continue anyway if lock check fails
+
+def release_lock(db):
+    """Release workflow lock."""
+    try:
+        db.collection('system').document('workflow_lock').delete()
+        print("    🔓 Lock libéré")
+    except Exception as e:
+        print(f"    ⚠️ Erreur release lock: {e}")
 
 # ============================================
 # Main
@@ -623,29 +679,37 @@ def main():
         print(f"❌ Firebase: {e}")
         sys.exit(1)
     
-    wait_for_next_minute()
+    # Check for parallel workflow
+    if not acquire_lock(db):
+        print("🛑 Workflow abandonné (autre instance en cours)")
+        sys.exit(0)
     
-    france_now = get_france_time()
-    init_cache(db, france_now)
-    
-    for i in range(QUERIES_PER_RUN):
-        now = datetime.now(timezone.utc)
+    try:
+        wait_for_next_minute()
+        
         france_now = get_france_time()
+        init_cache(db, france_now)
         
-        print(f"\n[{i+1}/{QUERIES_PER_RUN}] 🕐 {france_now.strftime('%H:%M:%S')}")
+        for i in range(QUERIES_PER_RUN):
+            now = datetime.now(timezone.utc)
+            france_now = get_france_time()
+            
+            print(f"\n[{i+1}/{QUERIES_PER_RUN}] 🕐 {france_now.strftime('%H:%M:%S')}")
+            
+            server_data = query_gmod_server(GMOD_HOST, GMOD_PORT)
+            
+            if server_data:
+                print(f"    ✅ {server_data['count']}/{server_data['max_players']} on {server_data['map']}")
+                sync_to_firebase(db, server_data, now, france_now)
+            else:
+                mark_offline(db)
+            
+            if i < QUERIES_PER_RUN - 1:
+                time.sleep(60)
         
-        server_data = query_gmod_server(GMOD_HOST, GMOD_PORT)
-        
-        if server_data:
-            print(f"    ✅ {server_data['count']}/{server_data['max_players']} on {server_data['map']}")
-            sync_to_firebase(db, server_data, now, france_now)
-        else:
-            mark_offline(db)
-        
-        if i < QUERIES_PER_RUN - 1:
-            time.sleep(60)
-    
-    print(f"\n🏁 Terminé")
+        print(f"\n🏁 Terminé")
+    finally:
+        release_lock(db)
 
 if __name__ == "__main__":
     main()
