@@ -22,6 +22,7 @@ import unicodedata
 import requests
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Set
+from html.parser import HTMLParser
 
 import a2s
 import firebase_admin
@@ -80,26 +81,107 @@ def steam2_to_steam64(steamid):
         return None
     return str(STEAMID64_BASE + (int(match.group(2)) * 2) + int(match.group(1)))
 
+class SteamAvatarParser(HTMLParser):
+    """Parse la page profil Steam pour extraire l'avatar"""
+    def __init__(self):
+        super().__init__()
+        self.in_inner = 0
+        self.in_frame = 0
+        self.animated = None
+        self.static_candidates = []
+
+    def _first_url_from_srcset(self, srcset):
+        if not srcset:
+            return None
+        first = srcset.split(",")[0].strip()
+        if not first:
+            return None
+        return first.split(" ")[0].strip()
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        klass = a.get("class", "")
+
+        if tag == "div":
+            if "playerAvatarAutoSizeInner" in klass:
+                self.in_inner += 1
+            elif self.in_inner > 0 and "profile_avatar_frame" in klass:
+                self.in_frame += 1
+
+        if self.in_inner <= 0 or self.in_frame > 0:
+            return
+
+        if tag == "img":
+            url = None
+            if "srcset" in a:
+                url = self._first_url_from_srcset(a.get("srcset", ""))
+            if not url and "src" in a:
+                url = a.get("src")
+
+            if url:
+                lower_url = url.lower()
+                if self.animated is None and any(lower_url.endswith(ext) for ext in (".gif", ".webm", ".mp4")):
+                    self.animated = url
+                elif any(lower_url.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                    self.static_candidates.append(url)
+
+        if tag == "source":
+            media = (a.get("media") or "").strip()
+            url = self._first_url_from_srcset(a.get("srcset", "") or "")
+            if url and any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                if "prefers-reduced-motion" in media:
+                    self.static_candidates.insert(0, url)
+                else:
+                    self.static_candidates.append(url)
+
+    def handle_endtag(self, tag):
+        if tag != "div":
+            return
+        if self.in_frame > 0:
+            self.in_frame -= 1
+            return
+        if self.in_inner > 0:
+            self.in_inner -= 1
+
 def fetch_steam_avatar(steamid, verbose=False):
+    """Récupère l'URL de l'avatar Steam à partir d'un Steam ID"""
     try:
         steam64 = steam2_to_steam64(steamid)
         if not steam64:
             if verbose:
                 print(f"            ⚠️ Conversion Steam64 échouée pour {steamid}")
             return None
+        
+        url = f"https://steamcommunity.com/profiles/{steam64}/?l=english"
         response = requests.get(
-            f"https://steamcommunity.com/profiles/{steam64}",
-            timeout=5,
-            headers={'User-Agent': 'Mozilla/5.0'}
+            url,
+            timeout=15,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            },
         )
+        
+        if response.status_code == 429:
+            if verbose:
+                print(f"            ⚠️ Rate-limit Steam pour {steamid}")
+            return None
+        
         if response.status_code != 200:
             if verbose:
                 print(f"            ⚠️ Steam HTTP {response.status_code} pour {steamid}")
             return None
-        for pattern in [r'<link rel="image_src" href="([^"]+)"', r'<meta property="og:image" content="([^"]+)"']:
-            match = re.search(pattern, response.text)
-            if match and 'steamcommunity.com' in match.group(1):
-                return match.group(1).replace('_medium', '_full')
+        
+        parser = SteamAvatarParser()
+        parser.feed(response.text)
+        
+        # Priorité à l'avatar animé, sinon statique
+        if parser.animated:
+            return parser.animated
+        if parser.static_candidates:
+            return parser.static_candidates[0]
+        
         if verbose:
             print(f"            ⚠️ Pas d'image trouvée pour {steamid}")
         return None
