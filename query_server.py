@@ -192,6 +192,28 @@ def init_cache(db, france_now):
     except:
         pass
     
+    # 5. Vérifier les avatars manquants pour les joueurs en ligne
+    avatars_checked = 0
+    avatars_added = 0
+    for live_name in cache['prev_names']:
+        found = find_player(live_name)
+        if found:
+            doc_id, player_data = found
+            steam_id = player_data.get('steam_id', '')
+            current_avatar = player_data.get('avatar_url', '')
+            
+            # Si pas d'avatar et Steam ID valide, récupérer
+            if not current_avatar and steam_id.startswith('STEAM_'):
+                avatars_checked += 1
+                new_avatar = fetch_steam_avatar(steam_id)
+                if new_avatar:
+                    db.collection('players').document(doc_id).update({'avatar_url': new_avatar})
+                    update_player_cache(doc_id, {**player_data, 'avatar_url': new_avatar})
+                    avatars_added += 1
+    
+    if avatars_checked > 0:
+        print(f"    🖼️ Avatars: {avatars_added}/{avatars_checked} ajoutés")
+    
     cache['today_date'] = today
     print(f"    📦 Stats H{france_now.hour}, peak={cache['daily_peak']}, record={cache['record_peak']}")
     print(f"    🔗 {len(cache['live_to_doc'])} joueurs mappés")

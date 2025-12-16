@@ -4,6 +4,8 @@ on:
   schedule:
     # Toutes les 30 minutes (0 et 30 de chaque heure)
     - cron: '0,30 * * * *'
+    # Backup: 2 minutes après (en cas de délai GitHub)
+    - cron: '2,32 * * * *'
   workflow_dispatch:
 
 concurrency:
