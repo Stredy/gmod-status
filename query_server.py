@@ -164,11 +164,9 @@ def init_cache(db, france_now):
             doc_id = doc.id
             cache['players'][doc_id] = data
             name = data.get('name', '')
+            # Index ONLY by Steam name, NOT by ingame_names
             cache['players_by_name'][name.lower().strip()] = doc_id
             cache['players_by_name'][normalize_name(name)] = doc_id
-            for ingame in data.get('ingame_names', []):
-                cache['players_by_name'][ingame.lower().strip()] = doc_id
-                cache['players_by_name'][normalize_name(ingame)] = doc_id
         reads += player_count
         print(f"    👥 {player_count} joueurs")
     except Exception as e:
@@ -205,13 +203,11 @@ def update_player_cache(doc_id, data):
         cache['players'][doc_id].update(data)
     else:
         cache['players'][doc_id] = data
+    # Index ONLY by Steam name, NOT by ingame_names
     name = data.get('name', '')
     if name:
         cache['players_by_name'][name.lower().strip()] = doc_id
         cache['players_by_name'][normalize_name(name)] = doc_id
-    for ingame in data.get('ingame_names', []):
-        cache['players_by_name'][ingame.lower().strip()] = doc_id
-        cache['players_by_name'][normalize_name(ingame)] = doc_id
 
 def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime):
     """Sync with Firebase using cache - ZERO unnecessary reads"""
@@ -278,10 +274,6 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                         if new_avatar and new_avatar != current_avatar:
                             update['avatar_url'] = new_avatar
                             print(f"          🖼️ maj: {name}")
-                
-                ingame = data.get('ingame_names', [])
-                if name not in ingame and name != data.get('name'):
-                    update['ingame_names'] = ingame + [name]
                 
                 db.collection('players').document(doc_id).update(update)
                 writes += 1
