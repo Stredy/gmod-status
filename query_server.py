@@ -49,6 +49,8 @@ cache = {
     # Previous live state (for comparison)
     'prev_names': set(),
     'prev_count': 0,
+    # Mapping direct: nom live -> doc_id (pour retrouver les joueurs au départ)
+    'live_to_doc': {},
 }
 
 def get_france_time():
@@ -172,7 +174,7 @@ def init_cache(db, france_now):
     except Exception as e:
         print(f"    ⚠️ Erreur joueurs: {e}")
     
-    # 4. État live actuel (pour initialiser prev_names)
+    # 4. État live actuel (pour initialiser prev_names et live_to_doc)
     try:
         live_doc = db.collection('live').document('status').get()
         reads += 1
@@ -181,12 +183,18 @@ def init_cache(db, france_now):
             cache['is_offline'] = not data.get('ok', True)
             cache['prev_count'] = data.get('count', 0)
             for p in data.get('players', []):
-                cache['prev_names'].add(p['name'])
+                live_name = p['name']
+                cache['prev_names'].add(live_name)
+                # Chercher le doc_id pour ce joueur et créer le mapping
+                found = find_player(live_name)
+                if found:
+                    cache['live_to_doc'][live_name] = found[0]
     except:
         pass
     
     cache['today_date'] = today
     print(f"    📦 Stats H{france_now.hour}, peak={cache['daily_peak']}, record={cache['record_peak']}")
+    print(f"    🔗 {len(cache['live_to_doc'])} joueurs mappés")
     print(f"    📊 Init: {reads} reads")
     return reads
 
@@ -278,6 +286,8 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                 db.collection('players').document(doc_id).update(update)
                 writes += 1
                 update_player_cache(doc_id, {**data, **update})
+                # Mapper le nom live au doc_id
+                cache['live_to_doc'][name] = doc_id
                 print(f"          ⬆️ {name}")
             else:
                 key = name.lower().strip()
@@ -292,6 +302,8 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                 db.collection('players').document(doc_id).set(new_player)
                 writes += 1
                 update_player_cache(doc_id, new_player)
+                # Mapper le nom live au doc_id
+                cache['live_to_doc'][name] = doc_id
                 print(f"          🆕 {name}")
         
         # Handle LEFT - need to read live/status to get session times
@@ -305,9 +317,19 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                     prev_data[p['name']] = p
             
             for name in left:
-                existing = find_player(name)
-                if existing:
-                    doc_id, data = existing
+                # Utiliser le mapping direct d'abord, puis fallback sur find_player
+                doc_id = cache['live_to_doc'].get(name)
+                data = None
+                
+                if doc_id and doc_id in cache['players']:
+                    data = cache['players'][doc_id]
+                else:
+                    # Fallback: chercher par nom
+                    existing = find_player(name)
+                    if existing:
+                        doc_id, data = existing
+                
+                if doc_id and data:
                     prev_session = prev_data.get(name, {}).get('time', 0)
                     new_total = data.get('total_time_seconds', 0) + prev_session
                     update = {
@@ -318,7 +340,13 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                     db.collection('players').document(doc_id).update(update)
                     writes += 1
                     update_player_cache(doc_id, {**data, **update})
+                    # Retirer du mapping
+                    cache['live_to_doc'].pop(name, None)
                     print(f"          👋 {name} (+{prev_session//60}min)")
+                else:
+                    # Joueur non trouvé - log warning
+                    print(f"          ⚠️ {name} non trouvé dans le cache!")
+                    cache['live_to_doc'].pop(name, None)
         
         # Live status - only if changed
         if not players_identical:
@@ -370,7 +398,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
         return False
 
 def mark_offline(db):
-    """Mark server offline - uses cache to avoid reads"""
+    """Mark server offline - SAVE player stats before clearing!"""
     global cache
     
     # Already offline in cache? Skip everything!
@@ -380,19 +408,60 @@ def mark_offline(db):
     
     try:
         now = datetime.now(timezone.utc)
+        writes = 0
+        reads = 0
+        
+        # IMPORTANT: Sauvegarder les stats des joueurs qui étaient connectés!
+        if cache['prev_names']:
+            # Lire le dernier état live pour avoir les temps de session
+            live_doc = db.collection('live').document('status').get()
+            reads += 1
+            prev_data = {}
+            if live_doc.exists:
+                for p in live_doc.to_dict().get('players', []):
+                    prev_data[p['name']] = p
+            
+            # Traiter chaque joueur comme "parti"
+            for name in cache['prev_names']:
+                doc_id = cache['live_to_doc'].get(name)
+                data = None
+                
+                if doc_id and doc_id in cache['players']:
+                    data = cache['players'][doc_id]
+                else:
+                    existing = find_player(name)
+                    if existing:
+                        doc_id, data = existing
+                
+                if doc_id and data:
+                    prev_session = prev_data.get(name, {}).get('time', 0)
+                    new_total = data.get('total_time_seconds', 0) + prev_session
+                    update = {
+                        'total_time_seconds': new_total,
+                        'last_seen': firestore.SERVER_TIMESTAMP,
+                        'current_session_start': None
+                    }
+                    db.collection('players').document(doc_id).update(update)
+                    writes += 1
+                    update_player_cache(doc_id, {**data, **update})
+                    print(f"          👋 {name} (+{prev_session//60}min)")
+                else:
+                    print(f"          ⚠️ {name} non trouvé!")
         
         # Mark in Firebase
         db.collection('live').document('status').set({
             'ok': False, 'count': 0, 'players': [],
             'timestamp': now.isoformat(), 'updatedAt': now.isoformat()
         })
+        writes += 1
         
         # Update cache
         cache['is_offline'] = True
         cache['prev_names'] = set()
         cache['prev_count'] = 0
+        cache['live_to_doc'] = {}
         
-        print(f"       ⚠️ Offline (1W/0R)")
+        print(f"       ⚠️ Offline ({writes}W/{reads}R)")
     except Exception as e:
         print(f"    ❌ Offline: {e}")
 
