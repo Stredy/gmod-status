@@ -80,10 +80,12 @@ def steam2_to_steam64(steamid):
         return None
     return str(STEAMID64_BASE + (int(match.group(2)) * 2) + int(match.group(1)))
 
-def fetch_steam_avatar(steamid):
+def fetch_steam_avatar(steamid, verbose=False):
     try:
         steam64 = steam2_to_steam64(steamid)
         if not steam64:
+            if verbose:
+                print(f"            ⚠️ Conversion Steam64 échouée pour {steamid}")
             return None
         response = requests.get(
             f"https://steamcommunity.com/profiles/{steam64}",
@@ -91,13 +93,19 @@ def fetch_steam_avatar(steamid):
             headers={'User-Agent': 'Mozilla/5.0'}
         )
         if response.status_code != 200:
+            if verbose:
+                print(f"            ⚠️ Steam HTTP {response.status_code} pour {steamid}")
             return None
         for pattern in [r'<link rel="image_src" href="([^"]+)"', r'<meta property="og:image" content="([^"]+)"']:
             match = re.search(pattern, response.text)
             if match and 'steamcommunity.com' in match.group(1):
                 return match.group(1).replace('_medium', '_full')
+        if verbose:
+            print(f"            ⚠️ Pas d'image trouvée pour {steamid}")
         return None
-    except:
+    except Exception as e:
+        if verbose:
+            print(f"            ⚠️ Erreur avatar {steamid}: {e}")
         return None
 
 def init_firebase():
@@ -205,11 +213,12 @@ def init_cache(db, france_now):
             # Si pas d'avatar et Steam ID valide, récupérer
             if not current_avatar and steam_id.startswith('STEAM_'):
                 avatars_checked += 1
-                new_avatar = fetch_steam_avatar(steam_id)
+                new_avatar = fetch_steam_avatar(steam_id, verbose=True)
                 if new_avatar:
                     db.collection('players').document(doc_id).update({'avatar_url': new_avatar})
                     update_player_cache(doc_id, {**player_data, 'avatar_url': new_avatar})
                     avatars_added += 1
+                    print(f"        ✅ Avatar: {live_name}")
     
     if avatars_checked > 0:
         print(f"    🖼️ Avatars: {avatars_added}/{avatars_checked} ajoutés")
