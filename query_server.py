@@ -288,7 +288,7 @@ def resolve_to_steamid64(session, profile_url, timeout=15):
     return None, "Impossible d'extraire steamID64."
 
 
-def find_steam_profile(pseudo, max_pages=3, timeout=10):
+def find_steam_profile(pseudo, max_pages=5, timeout=15):
     """
     Cherche un profil Steam par pseudo (case-sensitive exact match).
     Règles d'incertitude (retourne None):
@@ -302,91 +302,111 @@ def find_steam_profile(pseudo, max_pages=3, timeout=10):
     if not pseudo:
         return None, None, None, None
 
-    try:
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "*/*",
-            "Referer": "https://steamcommunity.com/search/users/",
-        })
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/120.0 Safari/537.36",
+        "Accept": "*/*",
+        "Referer": "https://steamcommunity.com/search/users/",
+    })
 
-        # Get session ID
+    # Get session ID
+    try:
         r0 = s.get("https://steamcommunity.com/", timeout=timeout)
         r0.raise_for_status()
-        sessionid = s.cookies.get("sessionid")
-        if not sessionid:
-            return None, None, None, None
+    except requests.RequestException:
+        return None, None, None, None
+    
+    sessionid = s.cookies.get("sessionid")
+    if not sessionid:
+        return None, None, None, None
 
-        def fetch_page(page):
-            r = s.get(
-                "https://steamcommunity.com/search/SearchCommunityAjax",
-                params={
-                    "text": pseudo,
-                    "filter": "users",
-                    "sessionid": sessionid,
-                    "steamid_user": "false",
-                    "page": str(page),
-                },
-                timeout=timeout,
-            )
-            r.raise_for_status()
-            html = _extract_html_from_ajax_response(r.text)
-            parser = SteamSearchParser()
-            parser.feed(html)
-            return parser.results
+    def fetch_page(page):
+        r = s.get(
+            "https://steamcommunity.com/search/SearchCommunityAjax",
+            params={
+                "text": pseudo,
+                "filter": "users",
+                "sessionid": sessionid,
+                "steamid_user": "false",
+                "page": str(page),
+            },
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        html = _extract_html_from_ajax_response(r.text)
+        parser = SteamSearchParser()
+        parser.feed(html)
+        return parser.results
 
-        # Fetch first page
+    # Fetch first page
+    try:
         p1 = fetch_page(1)
-        if not p1:
-            return None, None, None, None
+    except requests.RequestException:
+        return None, None, None, None
+    
+    if not p1:
+        return None, None, None, None
 
-        first_name, first_href = p1[0]
-        # Case-sensitive exact match required
-        if first_name != pseudo:
-            return None, None, None, None
+    first_name, first_href = p1[0]
+    # Case-sensitive exact match required
+    if first_name != pseudo:
+        return None, None, None, None
 
-        # Check for duplicates
-        exact_count = sum(1 for n, _ in p1 if n == pseudo)
+    # Check for duplicates
+    exact_count = sum(1 for n, _ in p1 if n == pseudo)
+    if exact_count > 1:
+        return None, None, None, None
+
+    for page in range(2, max_pages + 1):
+        try:
+            px = fetch_page(page)
+        except requests.RequestException:
+            break
+        if not px:
+            break
+        exact_count += sum(1 for n, _ in px if n == pseudo)
         if exact_count > 1:
             return None, None, None, None
 
-        for page in range(2, max_pages + 1):
-            try:
-                px = fetch_page(page)
-                if not px:
-                    break
-                exact_count += sum(1 for n, _ in px if n == pseudo)
-                if exact_count > 1:
-                    return None, None, None, None
-            except:
-                break
-
-        # Resolve to steamID64
-        steamid64, msg = resolve_to_steamid64(s, first_href)
-        if not steamid64:
-            return None, None, None, None
-
-        steam2 = steamid64_to_steamid2(steamid64)
-        profile_url = f"https://steamcommunity.com/profiles/{steamid64}"
-        
-        # Try to fetch avatar
-        avatar_url = None
+    # Resolve to steamID64
+    # First check if URL is already /profiles/xxxx
+    steamid64 = _extract_steamid64_from_profiles_url(first_href)
+    
+    if not steamid64:
+        # Need to fetch XML to get steamID64
+        xml_url = _to_xml_url(first_href)
         try:
-            r = s.get(profile_url + "/?l=english", timeout=timeout)
-            if r.status_code == 200:
-                parser = SteamAvatarParser()
-                parser.feed(r.text)
-                if parser.animated:
-                    avatar_url = parser.animated
-                elif parser.static_candidates:
-                    avatar_url = parser.static_candidates[0]
-        except:
-            pass
-
-        return steamid64, steam2, profile_url, avatar_url
-
-    except Exception as e:
+            r = s.get(xml_url, timeout=timeout)
+            r.raise_for_status()
+            parser = SteamID64Parser()
+            parser.feed(r.text)
+            steamid64 = parser.steamid64
+        except requests.RequestException:
+            return None, None, None, None
+    
+    if not steamid64:
         return None, None, None, None
+
+    steam2 = steamid64_to_steamid2(steamid64)
+    profile_url = f"https://steamcommunity.com/profiles/{steamid64}"
+    
+    # Try to fetch avatar
+    avatar_url = None
+    try:
+        r = s.get(profile_url + "/?l=english", timeout=timeout)
+        if r.status_code == 200:
+            parser = SteamAvatarParser()
+            parser.feed(r.text)
+            if parser.animated:
+                avatar_url = parser.animated
+            elif parser.static_candidates:
+                avatar_url = parser.static_candidates[0]
+    except:
+        pass  # Avatar is optional
+
+    return steamid64, steam2, profile_url, avatar_url
 
 
 def fetch_steam_avatar(steamid, verbose=False):
