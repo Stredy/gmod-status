@@ -291,9 +291,10 @@ def resolve_to_steamid64(session, profile_url, timeout=15):
 def find_steam_profile(pseudo, max_pages=5, timeout=15):
     """
     Cherche un profil Steam par pseudo (case-sensitive exact match).
+    Vérifie les 5 premiers résultats pour trouver une correspondance exacte.
     Règles d'incertitude (retourne None):
     - Aucun résultat
-    - 1er résultat != pseudo (case-sensitive)
+    - Aucun des 5 premiers résultats != pseudo (case-sensitive)
     - Plusieurs résultats exactement == pseudo (doublon)
     - Lien trouvé mais steamID64 non extractible (profil privé/bloqué)
     Retourne (steamid64, steam2, profile_url, avatar_url) ou (None, None, None, None)
@@ -349,16 +350,26 @@ def find_steam_profile(pseudo, max_pages=5, timeout=15):
     if not p1:
         return None, None, None, None
 
-    first_name, first_href = p1[0]
-    # Case-sensitive exact match required
-    if first_name != pseudo:
+    # Check first 5 results for an exact match (case-sensitive)
+    matched_href = None
+    check_limit = min(5, len(p1))
+    
+    for i in range(check_limit):
+        name, href = p1[i]
+        if name == pseudo:
+            matched_href = href
+            break
+    
+    # No exact match in first 5 results
+    if not matched_href:
         return None, None, None, None
 
-    # Check for duplicates
+    # Check for duplicates in first page
     exact_count = sum(1 for n, _ in p1 if n == pseudo)
     if exact_count > 1:
         return None, None, None, None
 
+    # Check remaining pages for duplicates
     for page in range(2, max_pages + 1):
         try:
             px = fetch_page(page)
@@ -372,11 +383,11 @@ def find_steam_profile(pseudo, max_pages=5, timeout=15):
 
     # Resolve to steamID64
     # First check if URL is already /profiles/xxxx
-    steamid64 = _extract_steamid64_from_profiles_url(first_href)
+    steamid64 = _extract_steamid64_from_profiles_url(matched_href)
     
     if not steamid64:
         # Need to fetch XML to get steamID64
-        xml_url = _to_xml_url(first_href)
+        xml_url = _to_xml_url(matched_href)
         try:
             r = s.get(xml_url, timeout=timeout)
             r.raise_for_status()
