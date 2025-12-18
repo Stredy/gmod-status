@@ -273,12 +273,11 @@ def init_firebase():
     if firebase_admin._apps:
         return firestore.client()
     
-    cred_json = os.environ.get('FIREBASE_CREDENTIALS', '')
-    if not cred_json:
-        raise ValueError("FIREBASE_CREDENTIALS not set")
+    service_account_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
+    if not service_account_json:
+        raise ValueError("FIREBASE_SERVICE_ACCOUNT not set")
     
-    cred_dict = json.loads(cred_json)
-    cred = credentials.Certificate(cred_dict)
+    cred = credentials.Certificate(json.loads(service_account_json))
     firebase_admin.initialize_app(cred)
     return firestore.client()
 
