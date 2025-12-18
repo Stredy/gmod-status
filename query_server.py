@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-GMod Server Status v15 - PRODUCTION OPTIMIZED
-- 30 queries per workflow (30 minutes)
-- Cache: players + stats + offline state
-- Workflow every 30 minutes via cron
-- Signal handling for graceful shutdown (saves stats on interruption)
-- Steam profile lookup for new players (auto SteamID + avatar)
+GMod Server Status v16 - ROBUST TIME TRACKING
+=============================================
 
-With 250 players:
-- Init: 252 reads (once per workflow)
-- Queries: 30 reads (1 per minute)
-- Total: 282 reads per workflow
-- 2 workflows/hour = 564 reads/hour
-- 24h = 13,536 reads/day (27% of quota)
+Architecture du comptage de temps :
+- session_baseline : temps de session (secondes) au moment où on commence à tracker
+- session_started_at : timestamp ISO pour l'affichage frontend
+- Quand un joueur part : time_to_add = final_time - session_baseline
+
+Cas gérés :
+1. Joueur rejoint → baseline = temps actuel, started_at = now - temps actuel
+2. Joueur part → ajoute (temps final - baseline) au total
+3. Changement de nom Steam → détecté, pas de double comptage
+4. Redémarrage backend → baseline recalculé pour joueurs déjà connectés
+5. Serveur offline → sauvegarde tous les temps correctement
+6. Crash/Signal → sauvegarde gracieuse
 """
 
 import os
@@ -24,7 +26,7 @@ import signal
 import unicodedata
 import requests
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Set
+from typing import Optional, Dict, Set, Tuple, List
 from html.parser import HTMLParser
 
 import a2s
@@ -48,16 +50,18 @@ cache = {
     'record_peak': 0,
     'today_date': None,
     # Players cache
-    'players': {},
-    'players_by_name': {},
-    # Offline state cache (NEW!)
+    'players': {},           # doc_id -> player data
+    'players_by_name': {},   # normalized_name -> doc_id
+    # Offline state cache
     'is_offline': False,
     'offline_since': None,
-    # Previous live state (for comparison)
+    # Previous live state
     'prev_names': set(),
     'prev_count': 0,
-    # Mapping direct: nom live -> doc_id (pour retrouver les joueurs au départ)
+    # Mapping: nom live -> doc_id
     'live_to_doc': {},
+    # Tracking sessions: nom live -> {'baseline': int, 'doc_id': str}
+    'active_sessions': {},
 }
 
 def get_france_time():
@@ -87,8 +91,10 @@ def steam2_to_steam64(steamid):
         return None
     return str(STEAMID64_BASE + (int(match.group(2)) * 2) + int(match.group(1)))
 
+# ============================================
+# Steam Avatar Parser
+# ============================================
 class SteamAvatarParser(HTMLParser):
-    """Parse la page profil Steam pour extraire l'avatar"""
     def __init__(self):
         super().__init__()
         self.in_inner = 0
@@ -99,519 +105,320 @@ class SteamAvatarParser(HTMLParser):
     def _first_url_from_srcset(self, srcset):
         if not srcset:
             return None
-        first = srcset.split(",")[0].strip()
-        if not first:
-            return None
-        return first.split(" ")[0].strip()
+        return srcset.split(",")[0].strip().split()[0]
 
     def handle_starttag(self, tag, attrs):
-        a = dict(attrs)
-        klass = a.get("class", "")
-
+        attrs_dict = dict(attrs)
+        classes = attrs_dict.get("class", "").split()
         if tag == "div":
-            if "playerAvatarAutoSizeInner" in klass:
+            if "playerAvatarAutoSizeInner" in classes:
                 self.in_inner += 1
-            elif self.in_inner > 0 and "profile_avatar_frame" in klass:
+            if "profile_avatar_frame" in classes:
                 self.in_frame += 1
-
-        if self.in_inner <= 0 or self.in_frame > 0:
-            return
-
-        if tag == "img":
-            url = None
-            if "srcset" in a:
-                url = self._first_url_from_srcset(a.get("srcset", ""))
-            if not url and "src" in a:
-                url = a.get("src")
-
-            if url:
-                lower_url = url.lower()
-                if self.animated is None and any(lower_url.endswith(ext) for ext in (".gif", ".webm", ".mp4")):
+        if tag == "img" and self.in_inner and not self.in_frame:
+            srcset = attrs_dict.get("srcset", "")
+            src = attrs_dict.get("src", "")
+            if "animated_avatar" in src or "animated_avatar" in srcset:
+                url = self._first_url_from_srcset(srcset) or src
+                if url:
                     self.animated = url
-                elif any(lower_url.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
-                    self.static_candidates.append(url)
-
-        if tag == "source":
-            media = (a.get("media") or "").strip()
-            url = self._first_url_from_srcset(a.get("srcset", "") or "")
-            if url and any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
-                if "prefers-reduced-motion" in media:
-                    self.static_candidates.insert(0, url)
-                else:
-                    self.static_candidates.append(url)
-
-    def handle_endtag(self, tag):
-        if tag != "div":
-            return
-        if self.in_frame > 0:
-            self.in_frame -= 1
-            return
-        if self.in_inner > 0:
-            self.in_inner -= 1
-
-class SteamSearchParser(HTMLParser):
-    """Extrait tous les <a class="searchPersonaName" href="...">TEXT</a> dans l'ordre."""
-    def __init__(self):
-        super().__init__()
-        self.results = []  # [(display_name, href), ...]
-        self._in_target_a = False
-        self._current_href = None
-        self._current_text_parts = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag.lower() != "a":
-            return
-        attr_dict = dict(attrs)
-        class_attr = attr_dict.get("class", "") or ""
-        classes = set(class_attr.split())
-        if "searchPersonaName" in classes and "href" in attr_dict:
-            self._in_target_a = True
-            self._current_href = attr_dict["href"]
-            self._current_text_parts = []
-
-    def handle_data(self, data):
-        if self._in_target_a:
-            self._current_text_parts.append(data)
-
-    def handle_endtag(self, tag):
-        if tag.lower() == "a" and self._in_target_a:
-            name = "".join(self._current_text_parts).strip()
-            href = self._current_href or ""
-            if name and href:
-                self.results.append((name, href))
-            self._in_target_a = False
-            self._current_href = None
-            self._current_text_parts = []
-
-
-class SteamID64Parser(HTMLParser):
-    """Parse la page XML (?xml=1) et extrait le contenu de <steamID64>...</steamID64>."""
-    def __init__(self):
-        super().__init__()
-        self.steamid64 = None
-        self._in_steamid64 = False
-        self._buf = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag.lower() == "steamid64":
-            self._in_steamid64 = True
-            self._buf = []
-
-    def handle_data(self, data):
-        if self._in_steamid64:
-            self._buf.append(data)
-
-    def handle_endtag(self, tag):
-        if tag.lower() == "steamid64" and self._in_steamid64:
-            val = "".join(self._buf).strip()
-            if val.isdigit():
-                self.steamid64 = val
-            self._in_steamid64 = False
-            self._buf = []
-
-
-# ============================================
-# Steam Profile Lookup
-# ============================================
-def _extract_html_from_ajax_response(text):
-    """L'endpoint Steam peut renvoyer du JSON avec un champ HTML, ou du HTML direct."""
-    t = text.lstrip()
-    if t.startswith("{"):
-        try:
-            obj = json.loads(text)
-            for key in ("html", "results_html", "searchresults", "data"):
-                if key in obj and isinstance(obj[key], str):
-                    return obj[key]
-        except json.JSONDecodeError:
-            pass
-    return text
-
-
-def _to_xml_url(profile_url):
-    """Ajoute ?xml=1 proprement à une URL de profil Steam."""
-    u = profile_url.strip()
-    if not u:
-        return u
-    if "xml=1" in u:
-        return u
-    if "?" in u:
-        return u + "&xml=1"
-    if u.endswith("/"):
-        return u + "?xml=1"
-    return u + "?xml=1"
-
-
-def _extract_steamid64_from_profiles_url(url):
-    """Extrait le steamID64 d'une URL /profiles/xxxx"""
-    marker = "/profiles/"
-    if marker in url:
-        tail = url.split(marker, 1)[1]
-        digits = ""
-        for ch in tail:
-            if ch.isdigit():
-                digits += ch
             else:
-                break
-        return digits if len(digits) >= 16 else None
-    return None
+                url = self._first_url_from_srcset(srcset) or src
+                if url:
+                    self.static_candidates.append(url)
 
+    def handle_endtag(self, tag):
+        if tag == "div":
+            if self.in_inner:
+                self.in_inner -= 1
+            if self.in_frame:
+                self.in_frame -= 1
 
-def steamid64_to_steamid2(steamid64):
-    """Convertit steamID64 -> SteamID2 (legacy): STEAM_0:X:Y"""
-    sid64 = int(steamid64)
-    base = 76561197960265728
-    a = sid64 - base
-    x = a % 2
-    y = (a - x) // 2
-    return f"STEAM_0:{x}:{y}"
+def fetch_steam_avatar(steam_id: str) -> Optional[str]:
+    """Fetch avatar from Steam profile page"""
+    steam64 = steam2_to_steam64(steam_id)
+    if not steam64:
+        return None
+    
+    url = f"https://steamcommunity.com/profiles/{steam64}"
+    try:
+        resp = requests.get(url, timeout=10, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        if resp.status_code != 200:
+            return None
+        parser = SteamAvatarParser()
+        parser.feed(resp.text)
+        return parser.animated or (parser.static_candidates[0] if parser.static_candidates else None)
+    except Exception:
+        return None
 
+# ============================================
+# Steam Profile Search
+# ============================================
+class SteamSearchParser(HTMLParser):
+    """Parse Steam search results"""
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self.in_result = False
+        self.current_url = None
+    
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        if tag == 'a' and 'searchPersonaName' in attrs_dict.get('class', ''):
+            self.current_url = attrs_dict.get('href')
+    
+    def handle_data(self, data):
+        if self.current_url:
+            self.results.append((data.strip(), self.current_url))
+            self.current_url = None
 
 def resolve_to_steamid64(session, profile_url, timeout=15):
-    """
-    Retourne (steamid64, message)
-    - Si déjà /profiles/xxxx, on extrait xxxx
-    - Sinon (/id/...), on fetch ?xml=1 et on lit <steamID64>
-    """
-    sid = _extract_steamid64_from_profiles_url(profile_url)
-    if sid:
-        return sid, "OK (déjà en steamID64)."
-
-    xml_url = _to_xml_url(profile_url)
-    r = session.get(xml_url, timeout=timeout)
-    r.raise_for_status()
-
-    parser = SteamID64Parser()
-    parser.feed(r.text)
-    if parser.steamid64:
-        return parser.steamid64, "OK (résolu via XML)."
-
-    return None, "Impossible d'extraire steamID64."
-
-
-def find_steam_profile(pseudo, max_pages=5, timeout=15):
-    """
-    Cherche un profil Steam par pseudo (case-sensitive exact match).
-    Vérifie les 5 premiers résultats pour trouver une correspondance exacte.
-    Règles d'incertitude (retourne None):
-    - Aucun résultat
-    - Aucun des 5 premiers résultats != pseudo (case-sensitive)
-    - Plusieurs résultats exactement == pseudo (doublon)
-    - Lien trouvé mais steamID64 non extractible (profil privé/bloqué)
-    Retourne (steamid64, steam2, profile_url, avatar_url) ou (None, None, None, None)
-    """
-    pseudo = pseudo.strip()
-    if not pseudo:
-        return None, None, None, None
-
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/120.0 Safari/537.36",
-        "Accept": "*/*",
-        "Referer": "https://steamcommunity.com/search/users/",
-    })
-
-    # Get session ID
+    """Resolve a Steam profile URL to SteamID64"""
     try:
-        r0 = s.get("https://steamcommunity.com/", timeout=timeout)
-        r0.raise_for_status()
-    except requests.RequestException:
-        return None, None, None, None
-    
-    sessionid = s.cookies.get("sessionid")
-    if not sessionid:
-        return None, None, None, None
+        if '/profiles/' in profile_url:
+            match = re.search(r'/profiles/(\d+)', profile_url)
+            if match:
+                return match.group(1)
+        
+        xml_url = profile_url.rstrip('/') + '/?xml=1'
+        r = session.get(xml_url, timeout=timeout)
+        if r.status_code == 200:
+            match = re.search(r'<steamID64>(\d+)</steamID64>', r.text)
+            if match:
+                return match.group(1)
+    except Exception:
+        pass
+    return None
 
-    def fetch_page(page):
-        r = s.get(
-            "https://steamcommunity.com/search/SearchCommunityAjax",
-            params={
-                "text": pseudo,
-                "filter": "users",
-                "sessionid": sessionid,
-                "steamid_user": "false",
-                "page": str(page),
-            },
-            timeout=timeout,
-        )
-        r.raise_for_status()
-        html = _extract_html_from_ajax_response(r.text)
+def steamid64_to_steam2(steamid64: str) -> Optional[str]:
+    """Convert SteamID64 to STEAM_X:Y:Z format"""
+    try:
+        steam64_int = int(steamid64)
+        y = steam64_int & 1
+        z = (steam64_int - STEAMID64_BASE - y) // 2
+        return f"STEAM_0:{y}:{z}"
+    except:
+        return None
+
+def find_steam_profile(player_name: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Search for a Steam profile by player name.
+    Returns: (steamid64, steam2, profile_url, avatar_url) or (None, None, None, None)
+    """
+    try:
+        s = requests.Session()
+        s.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept-Language': 'en-US,en;q=0.9'
+        })
+        
+        # Get session ID
+        s.get("https://steamcommunity.com", timeout=10)
+        sessionid = s.cookies.get("sessionid")
+        if not sessionid:
+            return (None, None, None, None)
+        
+        # Search
+        search_url = "https://steamcommunity.com/search/SearchCommunityAjax"
+        r = s.get(search_url, params={
+            "text": player_name,
+            "filter": "users",
+            "sessionid": sessionid,
+            "page": 1
+        }, timeout=15)
+        
+        if r.status_code != 200:
+            return (None, None, None, None)
+        
+        data = r.json()
+        html = data.get("html", "")
+        
         parser = SteamSearchParser()
         parser.feed(html)
-        return parser.results
-
-    # Fetch first page
-    try:
-        p1 = fetch_page(1)
-    except requests.RequestException:
-        return None, None, None, None
-    
-    if not p1:
-        return None, None, None, None
-
-    # Check first 5 results for an exact match (case-sensitive)
-    matched_href = None
-    check_limit = min(5, len(p1))
-    
-    for i in range(check_limit):
-        name, href = p1[i]
-        if name == pseudo:
-            matched_href = href
-            break
-    
-    # No exact match in first 5 results
-    if not matched_href:
-        return None, None, None, None
-
-    # Check for duplicates in first page
-    exact_count = sum(1 for n, _ in p1 if n == pseudo)
-    if exact_count > 1:
-        return None, None, None, None
-
-    # Check remaining pages for duplicates
-    for page in range(2, max_pages + 1):
-        try:
-            px = fetch_page(page)
-        except requests.RequestException:
-            break
-        if not px:
-            break
-        exact_count += sum(1 for n, _ in px if n == pseudo)
-        if exact_count > 1:
-            return None, None, None, None
-
-    # Resolve to steamID64
-    # First check if URL is already /profiles/xxxx
-    steamid64 = _extract_steamid64_from_profiles_url(matched_href)
-    
-    if not steamid64:
-        # Need to fetch XML to get steamID64
-        xml_url = _to_xml_url(matched_href)
-        try:
-            r = s.get(xml_url, timeout=timeout)
-            r.raise_for_status()
-            parser = SteamID64Parser()
-            parser.feed(r.text)
-            steamid64 = parser.steamid64
-        except requests.RequestException:
-            return None, None, None, None
-    
-    if not steamid64:
-        return None, None, None, None
-
-    steam2 = steamid64_to_steamid2(steamid64)
-    profile_url = f"https://steamcommunity.com/profiles/{steamid64}"
-    
-    # Try to fetch avatar
-    avatar_url = None
-    try:
-        r = s.get(profile_url + "/?l=english", timeout=timeout)
-        if r.status_code == 200:
-            parser = SteamAvatarParser()
-            parser.feed(r.text)
-            if parser.animated:
-                avatar_url = parser.animated
-            elif parser.static_candidates:
-                avatar_url = parser.static_candidates[0]
-    except:
-        pass  # Avatar is optional
-
-    return steamid64, steam2, profile_url, avatar_url
-
-
-def fetch_steam_avatar(steamid, verbose=False):
-    """Récupère l'URL de l'avatar Steam à partir d'un Steam ID"""
-    try:
-        steam64 = steam2_to_steam64(steamid)
-        if not steam64:
-            if verbose:
-                print(f"            ⚠️ Conversion Steam64 échouée pour {steamid}")
-            return None
         
-        url = f"https://steamcommunity.com/profiles/{steam64}/?l=english"
-        response = requests.get(
-            url,
-            timeout=15,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            },
-        )
+        if not parser.results:
+            return (None, None, None, None)
         
-        if response.status_code == 429:
-            if verbose:
-                print(f"            ⚠️ Rate-limit Steam pour {steamid}")
-            return None
+        # Check first 5 results for exact match
+        normalized_search = normalize_name(player_name)
+        for result_name, profile_url in parser.results[:5]:
+            if normalize_name(result_name) == normalized_search:
+                steamid64 = resolve_to_steamid64(s, profile_url)
+                if steamid64:
+                    steam2 = steamid64_to_steam2(steamid64)
+                    avatar_url = None
+                    try:
+                        resp = s.get(profile_url, timeout=10)
+                        if resp.status_code == 200:
+                            avatar_parser = SteamAvatarParser()
+                            avatar_parser.feed(resp.text)
+                            avatar_url = avatar_parser.animated or (avatar_parser.static_candidates[0] if avatar_parser.static_candidates else None)
+                    except:
+                        pass
+                    return (steamid64, steam2, profile_url, avatar_url)
         
-        if response.status_code != 200:
-            if verbose:
-                print(f"            ⚠️ Steam HTTP {response.status_code} pour {steamid}")
-            return None
+        return (None, None, None, None)
         
-        parser = SteamAvatarParser()
-        parser.feed(response.text)
-        
-        # Priorité à l'avatar animé, sinon statique
-        if parser.animated:
-            return parser.animated
-        if parser.static_candidates:
-            return parser.static_candidates[0]
-        
-        if verbose:
-            print(f"            ⚠️ Pas d'image trouvée pour {steamid}")
-        return None
     except Exception as e:
-        if verbose:
-            print(f"            ⚠️ Erreur avatar {steamid}: {e}")
-        return None
+        print(f"          ⚠️ Steam search error: {e}")
+        return (None, None, None, None)
 
+# ============================================
+# Firebase Cache
+# ============================================
 def init_firebase():
+    """Initialize Firebase with service account"""
     if firebase_admin._apps:
         return firestore.client()
-    service_account_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
-    if not service_account_json:
-        raise ValueError("FIREBASE_SERVICE_ACCOUNT not set")
-    cred = credentials.Certificate(json.loads(service_account_json))
+    
+    cred_json = os.environ.get('FIREBASE_CREDENTIALS', '')
+    if not cred_json:
+        raise ValueError("FIREBASE_CREDENTIALS not set")
+    
+    cred_dict = json.loads(cred_json)
+    cred = credentials.Certificate(cred_dict)
     firebase_admin.initialize_app(cred)
     return firestore.client()
 
-def query_gmod_server(host: str, port: int) -> Optional[dict]:
-    try:
-        address = (host, port)
-        info = a2s.info(address, timeout=10)
-        players = a2s.players(address, timeout=10)
-        player_list = []
-        for p in sorted(players, key=lambda x: x.duration, reverse=True):
-            if p.name and p.name.strip():
-                player_list.append({'name': p.name.strip(), 'time': int(p.duration)})
-        return {
-            'server_name': info.server_name,
-            'map': info.map_name,
-            'players': player_list,
-            'max_players': info.max_players,
-            'count': len(player_list)
-        }
-    except Exception as e:
-        print(f"    ❌ Serveur: {e}")
-        return None
-
-def init_cache(db, france_now):
-    """Load all caches once at workflow start"""
+def load_cache(db):
+    """Load all necessary data into cache at startup"""
     global cache
     reads = 0
-    today = france_now.strftime('%Y-%m-%d')
     
-    # 1. Stats du jour
-    try:
-        stats_doc = db.collection('stats').document('daily').collection('days').document(today).get()
-        reads += 1
-        if stats_doc.exists:
-            data = stats_doc.to_dict()
-            cache['hourly_stats'] = {int(k): v for k, v in data.get('hourly', {}).items()}
-            cache['daily_peak'] = data.get('peak', 0)
-    except:
-        pass
+    print("    📦 Loading cache...")
     
-    # 2. Record
-    try:
-        records_doc = db.collection('stats').document('records').get()
-        reads += 1
-        if records_doc.exists:
-            cache['record_peak'] = records_doc.to_dict().get('peak_count', 0)
-    except:
-        pass
+    # Load all players
+    players_docs = db.collection('players').get()
+    reads += len(players_docs) + 1
     
-    # 3. Tous les joueurs
-    try:
-        all_players = db.collection('players').get()
-        player_count = 0
-        for doc in all_players:
-            player_count += 1
-            data = doc.to_dict()
-            doc_id = doc.id
-            cache['players'][doc_id] = data
-            name = data.get('name', '')
-            # Index ONLY by Steam name, NOT by ingame_names
-            cache['players_by_name'][name.lower().strip()] = doc_id
+    for doc in players_docs:
+        data = doc.to_dict()
+        doc_id = doc.id
+        cache['players'][doc_id] = data
+        
+        # Index by normalized name
+        name = data.get('name', '')
+        if name:
             cache['players_by_name'][normalize_name(name)] = doc_id
-        reads += player_count
-        print(f"    👥 {player_count} joueurs")
-    except Exception as e:
-        print(f"    ⚠️ Erreur joueurs: {e}")
+        
+        # Index by normalized ingame names
+        for ig in data.get('ingame_names', []):
+            cache['players_by_name'][normalize_name(ig)] = doc_id
     
-    # 4. État live actuel (pour initialiser prev_names et live_to_doc)
-    try:
-        live_doc = db.collection('live').document('status').get()
-        reads += 1
-        if live_doc.exists:
-            data = live_doc.to_dict()
-            cache['is_offline'] = not data.get('ok', True)
-            cache['prev_count'] = data.get('count', 0)
-            for p in data.get('players', []):
-                live_name = p['name']
-                cache['prev_names'].add(live_name)
-                # Chercher le doc_id pour ce joueur et créer le mapping
-                found = find_player(live_name)
-                if found:
-                    cache['live_to_doc'][live_name] = found[0]
-    except:
-        pass
+    print(f"       ✓ {len(cache['players'])} joueurs")
     
-    # 5. Vérifier les avatars manquants pour les joueurs en ligne
-    avatars_checked = 0
-    avatars_added = 0
-    for live_name in cache['prev_names']:
-        found = find_player(live_name)
-        if found:
-            doc_id, player_data = found
-            steam_id = player_data.get('steam_id', '')
-            current_avatar = player_data.get('avatar_url', '')
-            
-            # Si pas d'avatar et Steam ID valide, récupérer
-            if not current_avatar and steam_id.startswith('STEAM_'):
-                avatars_checked += 1
-                new_avatar = fetch_steam_avatar(steam_id, verbose=True)
-                if new_avatar:
-                    db.collection('players').document(doc_id).update({'avatar_url': new_avatar})
-                    update_player_cache(doc_id, {**player_data, 'avatar_url': new_avatar})
-                    avatars_added += 1
-                    print(f"        ✅ Avatar: {live_name}")
-    
-    if avatars_checked > 0:
-        print(f"    🖼️ Avatars: {avatars_added}/{avatars_checked} ajoutés")
-    
+    # Load today's stats
+    france_now = get_france_time()
+    today = france_now.strftime('%Y-%m-%d')
     cache['today_date'] = today
-    print(f"    📦 Stats H{france_now.hour}, peak={cache['daily_peak']}, record={cache['record_peak']}")
-    print(f"    🔗 {len(cache['live_to_doc'])} joueurs mappés")
-    print(f"    📊 Init: {reads} reads")
+    
+    stats_doc = db.collection('stats').document('daily').collection('days').document(today).get()
+    reads += 1
+    if stats_doc.exists:
+        data = stats_doc.to_dict()
+        cache['daily_peak'] = data.get('peak', 0)
+        cache['hourly_stats'] = {int(k): v for k, v in data.get('hourly', {}).items()}
+    
+    # Load record
+    record_doc = db.collection('stats').document('records').get()
+    reads += 1
+    if record_doc.exists:
+        cache['record_peak'] = record_doc.to_dict().get('peak_count', 0)
+    
+    # Load live status for recovering active sessions
+    live_doc = db.collection('live').document('status').get()
+    reads += 1
+    if live_doc.exists:
+        live_data = live_doc.to_dict()
+        if live_data.get('ok', False):
+            # Server was online - recover session tracking
+            for p in live_data.get('players', []):
+                name = p['name']
+                session_time = p.get('time', 0)
+                cache['prev_names'].add(name)
+                
+                # Try to find the player's doc_id
+                existing = find_player(name)
+                if existing:
+                    doc_id, _ = existing
+                    cache['live_to_doc'][name] = doc_id
+                    # Restore session tracking with current baseline
+                    cache['active_sessions'][name] = {
+                        'baseline': session_time,
+                        'doc_id': doc_id
+                    }
+            
+            cache['prev_count'] = live_data.get('count', 0)
+            print(f"       ✓ Récupéré {len(cache['prev_names'])} sessions actives")
+        else:
+            cache['is_offline'] = True
+    
+    print(f"    ✅ Cache: {reads} reads")
     return reads
 
-def find_player(name):
-    key = name.lower().strip()
-    doc_id = cache['players_by_name'].get(key) or cache['players_by_name'].get(normalize_name(name))
+def update_player_cache(doc_id: str, data: dict):
+    """Update player in cache"""
+    cache['players'][doc_id] = data
+    name = data.get('name', '')
+    if name:
+        cache['players_by_name'][normalize_name(name)] = doc_id
+    for ig in data.get('ingame_names', []):
+        cache['players_by_name'][normalize_name(ig)] = doc_id
+
+def find_player(name: str) -> Optional[Tuple[str, dict]]:
+    """Find player by name (Steam name or ingame name)"""
+    normalized = normalize_name(name)
+    doc_id = cache['players_by_name'].get(normalized)
     if doc_id and doc_id in cache['players']:
         return (doc_id, cache['players'][doc_id])
     return None
 
-def update_player_cache(doc_id, data):
-    global cache
-    if doc_id in cache['players']:
-        cache['players'][doc_id].update(data)
-    else:
-        cache['players'][doc_id] = data
-    # Index ONLY by Steam name, NOT by ingame_names
-    name = data.get('name', '')
-    if name:
-        cache['players_by_name'][name.lower().strip()] = doc_id
-        cache['players_by_name'][normalize_name(name)] = doc_id
+# ============================================
+# Server Query
+# ============================================
+def query_gmod_server() -> Optional[dict]:
+    """Query GMod server for current status"""
+    try:
+        address = (GMOD_HOST, GMOD_PORT)
+        info = a2s.info(address, timeout=10)
+        players_raw = a2s.players(address, timeout=10)
+        
+        player_list = []
+        for p in players_raw:
+            if p.name and p.name.strip():
+                player_list.append({
+                    'name': p.name.strip(),
+                    'time': int(p.duration)  # Secondes depuis connexion au serveur
+                })
+        
+        return {
+            'ok': True,
+            'count': len(player_list),
+            'max_players': info.max_players,
+            'map': info.map_name,
+            'server_name': info.server_name,
+            'players': player_list
+        }
+    except Exception as e:
+        print(f"       ❌ Query: {e}")
+        return None
 
+# ============================================
+# Core Sync Logic - ROBUST TIME TRACKING
+# ============================================
 def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime):
-    """Sync with Firebase using cache - ZERO unnecessary reads"""
+    """
+    Sync with Firebase using robust time tracking.
+    
+    Key principle: We track session_baseline (time when we started tracking)
+    and only add (final_time - baseline) when player leaves.
+    """
     global cache
     
     try:
+        # Build current state
         current_players = {p['name']: p['time'] for p in server_data['players']}
         current_names = set(current_players.keys())
         current_count = server_data['count']
@@ -621,7 +428,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
         writes = 0
         reads = 0
         
-        # Reset offline state (server is responding)
+        # Reset offline state
         cache['is_offline'] = False
         
         # Day change?
@@ -631,7 +438,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
             cache['daily_peak'] = 0
             cache['today_date'] = today
         
-        # Use cached previous state instead of reading!
+        # Previous state
         previous_names = cache['prev_names']
         previous_count = cache['prev_count']
         
@@ -643,7 +450,138 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
         
         print(f"       📊 {current_count} | +{len(joined)} -{len(left)} ={len(stayed)}")
         
-        # Handle JOINED
+        # ============================================
+        # PHASE 1: Detect Steam name changes
+        # ============================================
+        # A name change = same SteamID in both joined and left
+        name_changes = {}  # old_name -> (new_name, steam_id, avatar_url)
+        
+        for new_name in list(joined):
+            # Check if this player has a SteamID that was in "left"
+            steamid64, steam2, profile_url, avatar_url = find_steam_profile(new_name)
+            
+            if steam2:
+                # Check if this SteamID was connected under a different name
+                for old_name in list(left):
+                    old_session = cache['active_sessions'].get(old_name)
+                    if old_session and old_session['doc_id'] == steam2:
+                        # Found a name change!
+                        name_changes[old_name] = (new_name, steam2, avatar_url)
+                        print(f"          🔄 Détecté: {old_name} → {new_name}")
+                        break
+        
+        # Remove name changes from joined/left sets
+        for old_name, (new_name, steam2, avatar_url) in name_changes.items():
+            joined.discard(new_name)
+            left.discard(old_name)
+        
+        # ============================================
+        # PHASE 2: Handle name changes (NO time counting)
+        # ============================================
+        for old_name, (new_name, steam2, avatar_url) in name_changes.items():
+            old_session = cache['active_sessions'].get(old_name, {})
+            data = cache['players'].get(steam2, {})
+            new_time = current_players[new_name]
+            
+            update = {
+                'name': new_name,
+                'last_seen': firestore.SERVER_TIMESTAMP,
+            }
+            
+            # Update avatar if found
+            if avatar_url and avatar_url != data.get('avatar_url'):
+                update['avatar_url'] = avatar_url
+            
+            db.collection('players').document(steam2).update(update)
+            writes += 1
+            update_player_cache(steam2, {**data, **update})
+            
+            # Update mappings - transfer session tracking to new name
+            cache['live_to_doc'].pop(old_name, None)
+            cache['live_to_doc'][new_name] = steam2
+            
+            # Transfer session with SAME baseline (session continues)
+            cache['active_sessions'].pop(old_name, None)
+            cache['active_sessions'][new_name] = {
+                'baseline': old_session.get('baseline', new_time),
+                'doc_id': steam2
+            }
+            
+            print(f"          🔄 {old_name} → {new_name} (session continue)")
+        
+        # ============================================
+        # PHASE 3: Handle real departures (ADD time)
+        # ============================================
+        for name in left:
+            session = cache['active_sessions'].get(name)
+            
+            if not session:
+                # No session tracking - try to find player
+                existing = find_player(name)
+                if existing:
+                    doc_id, data = existing
+                    # We don't have baseline, so we can't add time accurately
+                    # Just mark as offline
+                    update = {
+                        'last_seen': firestore.SERVER_TIMESTAMP,
+                        'current_session_start': None
+                    }
+                    db.collection('players').document(doc_id).update(update)
+                    writes += 1
+                    update_player_cache(doc_id, {**data, **update})
+                    print(f"          👋 {name} (pas de baseline)")
+                else:
+                    print(f"          ⚠️ {name} non trouvé!")
+                
+                cache['live_to_doc'].pop(name, None)
+                cache['active_sessions'].pop(name, None)
+                continue
+            
+            doc_id = session['doc_id']
+            baseline = session['baseline']
+            data = cache['players'].get(doc_id, {})
+            
+            # Get final session time from previous live status
+            # (we need to read it because player is now gone)
+            if not hasattr(sync_to_firebase, '_prev_player_times'):
+                # Read live/status to get final times
+                live_doc = db.collection('live').document('status').get()
+                reads += 1
+                sync_to_firebase._prev_player_times = {}
+                if live_doc.exists:
+                    for p in live_doc.to_dict().get('players', []):
+                        sync_to_firebase._prev_player_times[p['name']] = p.get('time', 0)
+            
+            final_time = sync_to_firebase._prev_player_times.get(name, baseline)
+            
+            # Calculate time to add: final - baseline
+            time_to_add = max(0, final_time - baseline)
+            
+            new_total = data.get('total_time_seconds', 0) + time_to_add
+            
+            update = {
+                'total_time_seconds': new_total,
+                'last_seen': firestore.SERVER_TIMESTAMP,
+                'current_session_start': None
+            }
+            
+            db.collection('players').document(doc_id).update(update)
+            writes += 1
+            update_player_cache(doc_id, {**data, **update})
+            
+            # Clean up
+            cache['live_to_doc'].pop(name, None)
+            cache['active_sessions'].pop(name, None)
+            
+            print(f"          👋 {name} (+{time_to_add//60}min, base={baseline//60}min)")
+        
+        # Clear temp storage
+        if hasattr(sync_to_firebase, '_prev_player_times'):
+            delattr(sync_to_firebase, '_prev_player_times')
+        
+        # ============================================
+        # PHASE 4: Handle real arrivals (START tracking)
+        # ============================================
         for name in joined:
             session_time = current_players[name]
             existing = find_player(name)
@@ -653,165 +591,186 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                 steam_id = data.get('steam_id', '')
                 current_avatar = data.get('avatar_url', '')
                 
+                # Calculate session_started_at for frontend display
+                session_started_at = (now - timedelta(seconds=session_time)).isoformat()
+                
                 update = {
                     'last_seen': firestore.SERVER_TIMESTAMP,
                     'connected_at': now.isoformat(),
-                    'current_session_start': session_time,
+                    'current_session_start': session_started_at,  # ISO timestamp for frontend
                     'session_count': data.get('session_count', 0) + 1
                 }
                 
-                # Avatar: fetch only if missing or on new session
-                if steam_id.startswith('STEAM_'):
-                    if not current_avatar:
-                        new_avatar = fetch_steam_avatar(steam_id)
-                        if new_avatar:
-                            update['avatar_url'] = new_avatar
-                            print(f"          🖼️ +avatar: {name}")
-                    else:
-                        new_avatar = fetch_steam_avatar(steam_id)
-                        if new_avatar and new_avatar != current_avatar:
-                            update['avatar_url'] = new_avatar
-                            print(f"          🖼️ maj: {name}")
+                # Fetch avatar if missing
+                if steam_id.startswith('STEAM_') and not current_avatar:
+                    new_avatar = fetch_steam_avatar(steam_id)
+                    if new_avatar:
+                        update['avatar_url'] = new_avatar
+                        print(f"          🖼️ +avatar: {name}")
                 
                 db.collection('players').document(doc_id).update(update)
                 writes += 1
                 update_player_cache(doc_id, {**data, **update})
-                # Mapper le nom live au doc_id
+                
+                # Start session tracking
                 cache['live_to_doc'][name] = doc_id
-                print(f"          ⬆️ {name}")
+                cache['active_sessions'][name] = {
+                    'baseline': session_time,
+                    'doc_id': doc_id
+                }
+                
+                print(f"          ⬆️ {name} (base={session_time//60}min)")
             else:
-                # Nouveau joueur - essayer de trouver son profil Steam
+                # New player - try to find Steam profile
                 steamid64, steam2, profile_url, avatar_url = find_steam_profile(name)
                 
+                # Calculate session_started_at for frontend
+                session_started_at = (now - timedelta(seconds=session_time)).isoformat()
+                
                 if steam2:
-                    # Profil Steam trouvé!
-                    # Vérifier si ce SteamID existe déjà (changement de nom)
+                    # Check if SteamID already exists
                     existing_by_steamid = cache['players'].get(steam2)
                     
                     if existing_by_steamid:
-                        # C'est un changement de nom Steam!
-                        doc_id = steam2
+                        # Update existing player with new name
                         update = {
-                            'name': name,  # Nouveau nom Steam
+                            'name': name,
                             'last_seen': firestore.SERVER_TIMESTAMP,
-                            'current_session_start': session_time
+                            'connected_at': now.isoformat(),
+                            'current_session_start': session_started_at,
+                            'session_count': existing_by_steamid.get('session_count', 0) + 1
+                        }
+                        if avatar_url:
+                            update['avatar_url'] = avatar_url
+                        
+                        db.collection('players').document(steam2).update(update)
+                        writes += 1
+                        update_player_cache(steam2, {**existing_by_steamid, **update})
+                        
+                        cache['live_to_doc'][name] = steam2
+                        cache['active_sessions'][name] = {
+                            'baseline': session_time,
+                            'doc_id': steam2
+                        }
+                        
+                        print(f"          ⬆️ {name} (steamid existant)")
+                    else:
+                        # Create new player with real SteamID
+                        new_player = {
+                            'name': name,
+                            'steam_id': steam2,
+                            'roles': ['Joueur'],
+                            'ingame_names': [],
+                            'created_at': firestore.SERVER_TIMESTAMP,
+                            'last_seen': firestore.SERVER_TIMESTAMP,
+                            'connected_at': now.isoformat(),
+                            'current_session_start': session_started_at,
+                            'total_time_seconds': 0,
+                            'session_count': 1,
+                            'is_auto_detected': False,
+                            'avatar_url': avatar_url
+                        }
+                        
+                        db.collection('players').document(steam2).set(new_player)
+                        writes += 1
+                        update_player_cache(steam2, new_player)
+                        
+                        cache['live_to_doc'][name] = steam2
+                        cache['active_sessions'][name] = {
+                            'baseline': session_time,
+                            'doc_id': steam2
+                        }
+                        
+                        print(f"          🆕✅ {name} ({steam2})")
+                else:
+                    # No Steam profile found - create auto_xxx
+                    key = name.lower().strip()
+                    doc_id = f"auto_{key.replace(' ', '_').replace('.', '_')[:50]}"
+                    
+                    existing_auto = cache['players'].get(doc_id)
+                    if existing_auto:
+                        update = {
+                            'last_seen': firestore.SERVER_TIMESTAMP,
+                            'connected_at': now.isoformat(),
+                            'current_session_start': session_started_at,
+                            'session_count': existing_auto.get('session_count', 0) + 1
                         }
                         db.collection('players').document(doc_id).update(update)
                         writes += 1
-                        update_player_cache(doc_id, {**existing_by_steamid, **update})
-                        cache['live_to_doc'][name] = doc_id
-                        print(f"          🔄 {name} (changement de nom)")
+                        update_player_cache(doc_id, {**existing_auto, **update})
                     else:
-                        # Nouveau joueur avec SteamID réel
-                        doc_id = steam2
                         new_player = {
-                            'name': name, 'steam_id': steam2, 'roles': ['Joueur'],
-                            'ingame_names': [], 'created_at': firestore.SERVER_TIMESTAMP,
-                            'last_seen': firestore.SERVER_TIMESTAMP, 'connected_at': now.isoformat(),
-                            'current_session_start': session_time, 'total_time_seconds': 0,
-                            'session_count': 1, 'is_auto_detected': False,
-                            'avatar_url': avatar_url
+                            'name': name,
+                            'steam_id': doc_id,
+                            'roles': ['Joueur'],
+                            'ingame_names': [],
+                            'created_at': firestore.SERVER_TIMESTAMP,
+                            'last_seen': firestore.SERVER_TIMESTAMP,
+                            'connected_at': now.isoformat(),
+                            'current_session_start': session_started_at,
+                            'total_time_seconds': 0,
+                            'session_count': 1,
+                            'is_auto_detected': True
                         }
                         db.collection('players').document(doc_id).set(new_player)
                         writes += 1
                         update_player_cache(doc_id, new_player)
-                        cache['live_to_doc'][name] = doc_id
-                        print(f"          🆕✅ {name} ({steam2})")
-                else:
-                    # Profil Steam non trouvé - fallback auto_xxx
-                    key = name.lower().strip()
-                    doc_id = f"auto_{key.replace(' ', '_').replace('.', '_')[:50]}"
-                    new_player = {
-                        'name': name, 'steam_id': doc_id, 'roles': ['Joueur'],
-                        'ingame_names': [], 'created_at': firestore.SERVER_TIMESTAMP,
-                        'last_seen': firestore.SERVER_TIMESTAMP, 'connected_at': now.isoformat(),
-                        'current_session_start': session_time, 'total_time_seconds': 0,
-                        'session_count': 1, 'is_auto_detected': True
-                    }
-                    db.collection('players').document(doc_id).set(new_player)
-                    writes += 1
-                    update_player_cache(doc_id, new_player)
+                    
                     cache['live_to_doc'][name] = doc_id
+                    cache['active_sessions'][name] = {
+                        'baseline': session_time,
+                        'doc_id': doc_id
+                    }
+                    
                     print(f"          🆕 {name} (auto)")
         
-        # Handle LEFT - need to read live/status to get session times
-        if left:
-            # Only read if someone left (to get their session time)
-            live_doc = db.collection('live').document('status').get()
-            reads += 1
-            prev_data = {}
-            if live_doc.exists:
-                for p in live_doc.to_dict().get('players', []):
-                    prev_data[p['name']] = p
-            
-            for name in left:
-                # Utiliser le mapping direct d'abord, puis fallback sur find_player
-                doc_id = cache['live_to_doc'].get(name)
-                data = None
-                
-                if doc_id and doc_id in cache['players']:
-                    data = cache['players'][doc_id]
-                else:
-                    # Fallback: chercher par nom
-                    existing = find_player(name)
-                    if existing:
-                        doc_id, data = existing
-                
-                if doc_id and data:
-                    prev_session = prev_data.get(name, {}).get('time', 0)
-                    new_total = data.get('total_time_seconds', 0) + prev_session
-                    update = {
-                        'total_time_seconds': new_total,
-                        'last_seen': firestore.SERVER_TIMESTAMP,
-                        'current_session_start': None
-                    }
-                    db.collection('players').document(doc_id).update(update)
-                    writes += 1
-                    update_player_cache(doc_id, {**data, **update})
-                    # Retirer du mapping
-                    cache['live_to_doc'].pop(name, None)
-                    print(f"          👋 {name} (+{prev_session//60}min)")
-                else:
-                    # Joueur non trouvé - log warning
-                    print(f"          ⚠️ {name} non trouvé dans le cache!")
-                    cache['live_to_doc'].pop(name, None)
-        
-        # Live status - only if changed
+        # ============================================
+        # PHASE 5: Update live status
+        # ============================================
         if not players_identical:
             db.collection('live').document('status').set({
-                'ok': True, 'count': current_count,
-                'max': server_data['max_players'], 'map': server_data['map'],
-                'server': server_data['server_name'], 'players': server_data['players'],
-                'timestamp': now.isoformat(), 'updatedAt': now.isoformat()
+                'ok': True,
+                'count': current_count,
+                'max': server_data['max_players'],
+                'map': server_data['map'],
+                'server': server_data['server_name'],
+                'players': server_data['players'],
+                'timestamp': now.isoformat(),
+                'updatedAt': now.isoformat()
             })
             writes += 1
         else:
             print(f"       ⏭️ Live identique")
         
-        # Update cache for next iteration
+        # Update cache
         cache['prev_names'] = current_names.copy()
         cache['prev_count'] = current_count
         
-        # Stats (use cache)
+        # ============================================
+        # PHASE 6: Stats
+        # ============================================
         cached_hour = cache['hourly_stats'].get(hour, -1)
         if cached_hour == -1 or current_count > cached_hour:
             cache['hourly_stats'][hour] = max(cached_hour if cached_hour >= 0 else 0, current_count)
             cache['daily_peak'] = max(cache['daily_peak'], current_count)
             hourly_fb = {str(k): v for k, v in cache['hourly_stats'].items()}
             db.collection('stats').document('daily').collection('days').document(today).set({
-                'date': today, 'peak': cache['daily_peak'],
-                'hourly': hourly_fb, 'last_update': firestore.SERVER_TIMESTAMP
+                'date': today,
+                'peak': cache['daily_peak'],
+                'hourly': hourly_fb,
+                'last_update': firestore.SERVER_TIMESTAMP
             }, merge=True)
             writes += 1
             print(f"       📈 H{hour}: {current_count}")
         else:
             print(f"       ⏭️ H{hour} cache: {cached_hour}")
         
-        # Records (use cache)
+        # Records
         if current_count > cache['record_peak']:
             cache['record_peak'] = current_count
             db.collection('stats').document('records').set({
-                'peak_count': current_count, 'peak_date': now.isoformat()
+                'peak_count': current_count,
+                'peak_date': now.isoformat()
             })
             writes += 1
             print(f"       🏆 Record: {current_count}!")
@@ -826,10 +785,9 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
         return False
 
 def mark_offline(db):
-    """Mark server offline - SAVE player stats before clearing!"""
+    """Mark server offline - save all player times correctly"""
     global cache
     
-    # Already offline in cache? Skip everything!
     if cache['is_offline']:
         print(f"       ⏭️ Déjà offline (cache)")
         return
@@ -839,79 +797,77 @@ def mark_offline(db):
         writes = 0
         reads = 0
         
-        # IMPORTANT: Sauvegarder les stats des joueurs qui étaient connectés!
+        # Get final times from live/status
+        prev_player_times = {}
         if cache['prev_names']:
-            # Lire le dernier état live pour avoir les temps de session
             live_doc = db.collection('live').document('status').get()
             reads += 1
-            prev_data = {}
             if live_doc.exists:
                 for p in live_doc.to_dict().get('players', []):
-                    prev_data[p['name']] = p
-            
-            # Traiter chaque joueur comme "parti"
-            for name in cache['prev_names']:
-                doc_id = cache['live_to_doc'].get(name)
-                data = None
-                
-                if doc_id and doc_id in cache['players']:
-                    data = cache['players'][doc_id]
-                else:
-                    existing = find_player(name)
-                    if existing:
-                        doc_id, data = existing
-                
-                if doc_id and data:
-                    prev_session = prev_data.get(name, {}).get('time', 0)
-                    new_total = data.get('total_time_seconds', 0) + prev_session
-                    update = {
-                        'total_time_seconds': new_total,
-                        'last_seen': firestore.SERVER_TIMESTAMP,
-                        'current_session_start': None
-                    }
-                    db.collection('players').document(doc_id).update(update)
-                    writes += 1
-                    update_player_cache(doc_id, {**data, **update})
-                    print(f"          👋 {name} (+{prev_session//60}min)")
-                else:
-                    print(f"          ⚠️ {name} non trouvé!")
+                    prev_player_times[p['name']] = p.get('time', 0)
         
-        # Mark in Firebase
+        # Save time for each active session
+        for name, session in cache['active_sessions'].items():
+            doc_id = session['doc_id']
+            baseline = session['baseline']
+            data = cache['players'].get(doc_id, {})
+            
+            final_time = prev_player_times.get(name, baseline)
+            time_to_add = max(0, final_time - baseline)
+            
+            new_total = data.get('total_time_seconds', 0) + time_to_add
+            
+            update = {
+                'total_time_seconds': new_total,
+                'last_seen': firestore.SERVER_TIMESTAMP,
+                'current_session_start': None
+            }
+            
+            db.collection('players').document(doc_id).update(update)
+            writes += 1
+            update_player_cache(doc_id, {**data, **update})
+            
+            print(f"          👋 {name} (+{time_to_add//60}min)")
+        
+        # Mark as offline
         db.collection('live').document('status').set({
-            'ok': False, 'count': 0, 'players': [],
-            'timestamp': now.isoformat(), 'updatedAt': now.isoformat()
+            'ok': False,
+            'count': 0,
+            'players': [],
+            'timestamp': now.isoformat(),
+            'updatedAt': now.isoformat()
         })
         writes += 1
         
-        # Update cache
+        # Clear cache
         cache['is_offline'] = True
         cache['prev_names'] = set()
         cache['prev_count'] = 0
         cache['live_to_doc'] = {}
+        cache['active_sessions'] = {}
         
         print(f"       ⚠️ Offline ({writes}W/{reads}R)")
+        
     except Exception as e:
         print(f"    ❌ Offline: {e}")
 
 # ============================================
-# Signal Handling (graceful shutdown)
+# Signal Handling
 # ============================================
 def graceful_shutdown(signum, frame):
-    """Handle termination signal - save player stats and release lock before exit"""
+    """Handle termination - save all player times"""
     global _db, cache
     signal_name = signal.Signals(signum).name
     print(f"\n⚠️ Signal {signal_name} reçu - sauvegarde en cours...")
     
     if _db:
-        # Save player stats
-        if cache.get('prev_names'):
+        if cache.get('active_sessions'):
             try:
                 mark_offline(_db)
                 print("✅ Stats sauvegardées avant arrêt")
             except Exception as e:
                 print(f"❌ Erreur sauvegarde: {e}")
         
-        # Release lock
         try:
             _db.collection('system').document('workflow_lock').delete()
             print("🔓 Lock libéré")
@@ -920,56 +876,54 @@ def graceful_shutdown(signum, frame):
     
     sys.exit(0)
 
-# Register signal handlers
 signal.signal(signal.SIGTERM, graceful_shutdown)
 signal.signal(signal.SIGINT, graceful_shutdown)
 
 # ============================================
-# Workflow Lock (prevent parallel execution)
+# Workflow Lock
 # ============================================
 def acquire_lock(db):
-    """Try to acquire workflow lock. Returns True if acquired, False if another workflow is running."""
+    """Try to acquire workflow lock"""
     lock_ref = db.collection('system').document('workflow_lock')
-    now = datetime.now(timezone.utc)
     
     try:
         lock_doc = lock_ref.get()
         if lock_doc.exists:
             lock_data = lock_doc.to_dict()
-            lock_time = lock_data.get('started_at')
-            if lock_time:
-                # Convert Firestore timestamp to datetime
-                if hasattr(lock_time, 'timestamp'):
-                    lock_time = datetime.fromtimestamp(lock_time.timestamp(), tz=timezone.utc)
+            locked_at = lock_data.get('locked_at')
+            
+            if locked_at:
+                if hasattr(locked_at, 'timestamp'):
+                    lock_time = datetime.fromtimestamp(locked_at.timestamp(), tz=timezone.utc)
+                else:
+                    lock_time = datetime.fromisoformat(locked_at.replace('Z', '+00:00'))
                 
-                # Lock is valid if less than 35 minutes old
-                age_minutes = (now - lock_time).total_seconds() / 60
-                if age_minutes < 35:
-                    print(f"    🔒 Autre workflow en cours depuis {age_minutes:.1f}min - abandon")
+                age = (datetime.now(timezone.utc) - lock_time).total_seconds()
+                
+                if age < 1800:  # 30 minutes
+                    print(f"🔒 Lock actif depuis {int(age)}s")
                     return False
                 else:
-                    print(f"    ⚠️ Lock expiré ({age_minutes:.1f}min) - reprise")
+                    print(f"🔓 Lock expiré ({int(age)}s) - récupération")
         
-        # Acquire lock
         lock_ref.set({
-            'started_at': firestore.SERVER_TIMESTAMP,
-            'pid': os.getpid(),
-            'status': 'running'
+            'locked_at': firestore.SERVER_TIMESTAMP,
+            'workflow_id': os.environ.get('GITHUB_RUN_ID', 'local')
         })
-        print("    🔓 Lock acquis")
+        print("🔐 Lock acquis")
         return True
         
     except Exception as e:
-        print(f"    ⚠️ Erreur lock: {e} - continuation")
-        return True  # Continue anyway if lock check fails
+        print(f"⚠️ Lock error: {e}")
+        return False
 
 def release_lock(db):
-    """Release workflow lock."""
+    """Release workflow lock"""
     try:
         db.collection('system').document('workflow_lock').delete()
-        print("    🔓 Lock libéré")
+        print("🔓 Lock libéré")
     except Exception as e:
-        print(f"    ⚠️ Erreur release lock: {e}")
+        print(f"⚠️ Release lock error: {e}")
 
 # ============================================
 # Main
@@ -978,48 +932,45 @@ def main():
     global _db
     
     print("=" * 50)
-    print(f"🎮 GMod Status v15 ({QUERIES_PER_RUN} queries/30min)")
+    print("🎮 GMod Status v16 - Robust Time Tracking")
     print("=" * 50)
     
-    try:
-        db = init_firebase()
-        _db = db  # For signal handler
-        print("✅ Firebase OK")
-    except Exception as e:
-        print(f"❌ Firebase: {e}")
-        sys.exit(1)
+    # Initialize Firebase
+    print("\n📡 Connexion Firebase...")
+    db = init_firebase()
+    _db = db
+    print("    ✅ Connecté")
     
-    # Check for parallel workflow
+    # Acquire lock
     if not acquire_lock(db):
-        print("🛑 Workflow abandonné (autre instance en cours)")
+        print("❌ Autre workflow en cours - abandon")
         sys.exit(0)
     
-    try:
+    # Load cache
+    load_cache(db)
+    
+    # Query loop
+    print(f"\n🔄 Démarrage ({QUERIES_PER_RUN} queries)...")
+    
+    for i in range(QUERIES_PER_RUN):
         wait_for_next_minute()
         
+        now = datetime.now(timezone.utc)
         france_now = get_france_time()
-        init_cache(db, france_now)
         
-        for i in range(QUERIES_PER_RUN):
-            now = datetime.now(timezone.utc)
-            france_now = get_france_time()
-            
-            print(f"\n[{i+1}/{QUERIES_PER_RUN}] 🕐 {france_now.strftime('%H:%M:%S')}")
-            
-            server_data = query_gmod_server(GMOD_HOST, GMOD_PORT)
-            
-            if server_data:
-                print(f"    ✅ {server_data['count']}/{server_data['max_players']} on {server_data['map']}")
-                sync_to_firebase(db, server_data, now, france_now)
-            else:
-                mark_offline(db)
-            
-            if i < QUERIES_PER_RUN - 1:
-                time.sleep(60)
+        print(f"\n[{i+1}/{QUERIES_PER_RUN}] {france_now.strftime('%H:%M:%S')}")
         
-        print(f"\n🏁 Terminé")
-    finally:
-        release_lock(db)
+        # Query server
+        server_data = query_gmod_server()
+        
+        if server_data:
+            sync_to_firebase(db, server_data, now, france_now)
+        else:
+            mark_offline(db)
+    
+    # Cleanup
+    release_lock(db)
+    print("\n✅ Terminé")
 
 if __name__ == "__main__":
     main()
