@@ -94,7 +94,11 @@ cache = {
     'prev_times': {},        # name -> time (pour détecter reset)
     # Session tracking
     'sessions': {},          # name -> {'started_at': datetime, 'doc_id': str}
+    # Timeout tracking
+    'consecutive_timeouts': 0,  # Nombre de timeouts consécutifs
 }
+
+TIMEOUTS_BEFORE_OFFLINE = 4  # Attendre 4 timeouts (2min) avant de considérer offline
 
 def wait_for_next_interval():
     """Attend le prochain intervalle de 30 secondes (:00 ou :30)"""
@@ -448,9 +452,10 @@ def init_cache(db, france_now):
                 
                 found = find_player(name)
                 if found:
+                    doc_id, player_data = found
                     cache['sessions'][name] = {
                         'started_at': started_at,
-                        'doc_id': found[0]
+                        'doc_id': doc_id
                     }
             
             print(f"    🔗 {len(cache['sessions'])} sessions actives")
@@ -766,10 +771,10 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                         'session_count': data.get('session_count', 0) + 1
                     }
                     
-                    # Avatar manquant?
-                    if steam_id.startswith('STEAM_') and not data.get('avatar_url'):
+                    # Refresh avatar à chaque arrivée (si SteamID valide)
+                    if steam_id.startswith('STEAM_'):
                         avatar = fetch_steam_avatar(steam_id)
-                        if avatar:
+                        if avatar and avatar != data.get('avatar_url'):
                             update['avatar_url'] = avatar
                             print(f"          🖼️ Avatar: {name}")
                     
@@ -868,7 +873,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                 print(f"          ❌ Arrivée {name}: {e}")
         
         # ============================================
-        # PHASE 6: Stayed sans session
+        # PHASE 6: Stayed - s'assurer qu'ils ont une session
         # ============================================
         for name in stayed:
             if name not in cache['sessions']:
@@ -880,20 +885,6 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                     doc_id = sanitize_doc_id(existing[0])
                     if doc_id:
                         cache['sessions'][name] = {'started_at': started_at, 'doc_id': doc_id}
-                        
-                        # Vérifier avatar
-                        data = existing[1]
-                        steam_id = data.get('steam_id', '')
-                        if steam_id.startswith('STEAM_') and not data.get('avatar_url'):
-                            try:
-                                avatar = fetch_steam_avatar(steam_id)
-                                if avatar:
-                                    db.collection('players').document(doc_id).update({'avatar_url': avatar})
-                                    writes += 1
-                                    update_player_cache(doc_id, {**data, 'avatar_url': avatar})
-                                    print(f"          🖼️ Avatar: {name}")
-                            except:
-                                pass
         
         # ============================================
         # PHASE 7: Live/status (avec timestamps!)
@@ -1138,9 +1129,19 @@ def main():
         server_data = query_gmod_server()
         
         if server_data:
+            # Reset timeout counter on success
+            cache['consecutive_timeouts'] = 0
             sync_to_firebase(db, server_data, now, france_now)
         else:
-            mark_offline(db)
+            # Increment timeout counter
+            cache['consecutive_timeouts'] += 1
+            
+            if cache['consecutive_timeouts'] >= TIMEOUTS_BEFORE_OFFLINE:
+                # Vraiment offline après plusieurs échecs
+                mark_offline(db)
+            else:
+                # Juste un timeout temporaire, on attend
+                print(f"       ⏳ Timeout {cache['consecutive_timeouts']}/{TIMEOUTS_BEFORE_OFFLINE} (attente...)")
     
     release_lock(db)
     print("\n✅ Terminé")
