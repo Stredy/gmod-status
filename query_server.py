@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
-GMod Server Status v20 - BULLETPROOF TIME TRACKING
-==================================================
+GMod Server Status v20 - PERFECT & BULLETPROOF
+===============================================
 
+Intervalle: 30 secondes (60 queries par run de 30 min)
 Principe: session_started_at = now - time (timestamp absolu)
-Au départ: duration = now - session_started_at
 
-Protections:
-1. Timezone France correcte (été/hiver)
+Protections complètes:
+1. Timezone France correcte (été/hiver avec zoneinfo)
 2. Détection changement de nom Steam (évite double comptage)
 3. Détection reset serveur GMod (temps qui diminue)
-4. Sanitization doc_id
-5. Try/except par joueur
+4. Sanitization doc_id (pas de slash, etc.)
+5. Try/except par joueur (isolation des erreurs)
+6. Cache des résultats Steam (évite doubles appels)
+7. Vérification cohérence temporelle
+8. Cap de sécurité sur les durées
 
-Structure live/status.players[]:
-{
-    "name": "Alice",
-    "time": 3600,
-    "session_started_at": "2024-01-15T14:30:00+00:00"
-}
+Quotas Firebase (optimisés pour 30s):
+- Init: ~200 reads (1x par run)
+- Par query: 0-3 writes
+- Par run (60 queries): ~100 writes max
+- Par jour (48 runs): ~5000 writes, ~10000 reads
+- Limites: 20k writes, 50k reads → ~25% utilisé
 """
 
 import os
@@ -37,7 +40,7 @@ import a2s
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# Try to use proper timezone, fallback to manual calculation
+# Timezone France avec gestion DST
 try:
     from zoneinfo import ZoneInfo
     PARIS_TZ = ZoneInfo('Europe/Paris')
@@ -46,21 +49,20 @@ try:
 except ImportError:
     PARIS_TZ = None
     def get_france_time():
-        """Manual DST calculation for France (last Sunday of March/October)"""
+        """Fallback: calcul manuel DST France"""
         now_utc = datetime.now(timezone.utc)
         year = now_utc.year
         
-        # Last Sunday of March (start DST)
+        # Dernier dimanche de mars 2h → été (UTC+2)
         march_last = datetime(year, 3, 31, 2, 0, tzinfo=timezone.utc)
-        while march_last.weekday() != 6:  # Sunday
+        while march_last.weekday() != 6:
             march_last -= timedelta(days=1)
         
-        # Last Sunday of October (end DST)
+        # Dernier dimanche d'octobre 3h → hiver (UTC+1)
         october_last = datetime(year, 10, 31, 3, 0, tzinfo=timezone.utc)
         while october_last.weekday() != 6:
             october_last -= timedelta(days=1)
         
-        # UTC+2 in summer, UTC+1 in winter
         if march_last <= now_utc < october_last:
             return now_utc + timedelta(hours=2)
         else:
@@ -68,7 +70,8 @@ except ImportError:
 
 GMOD_HOST = os.environ.get('GMOD_HOST', '51.91.215.65')
 GMOD_PORT = int(os.environ.get('GMOD_PORT', '27015'))
-QUERIES_PER_RUN = 30
+QUERIES_PER_RUN = 60  # 60 * 30s = 30 minutes
+QUERY_INTERVAL = 30   # secondes
 
 _db = None
 
@@ -88,17 +91,26 @@ cache = {
     'is_offline': False,
     'prev_names': set(),
     'prev_count': 0,
-    'prev_times': {},        # name -> time (pour détecter reset serveur)
+    'prev_times': {},        # name -> time (pour détecter reset)
     # Session tracking
     'sessions': {},          # name -> {'started_at': datetime, 'doc_id': str}
 }
 
-def wait_for_next_minute():
+def wait_for_next_interval():
+    """Attend le prochain intervalle de 30 secondes (:00 ou :30)"""
     now = datetime.now()
-    seconds_to_wait = 60 - now.second - (now.microsecond / 1_000_000)
-    if 0 < seconds_to_wait < 60:
-        print(f"    ⏳ Attente {seconds_to_wait:.1f}s → XX:{(now.minute + 1) % 60:02d}:00")
-        time.sleep(seconds_to_wait)
+    seconds = now.second + now.microsecond / 1_000_000
+    
+    if seconds < 30:
+        wait = 30 - seconds
+        target = 30
+    else:
+        wait = 60 - seconds
+        target = 0
+    
+    if wait > 0.5:
+        print(f"    ⏳ {wait:.1f}s → :XX:{target:02d}")
+        time.sleep(wait)
 
 # ============================================
 # Helpers
@@ -115,9 +127,10 @@ def normalize_name(name):
     return re.sub(r'[^a-z0-9]', '', name)
 
 def sanitize_doc_id(doc_id):
+    """Sanitize pour Firestore: pas de slash, max 100 chars"""
     if not doc_id:
         return None
-    doc_id = doc_id.replace('/', '_').replace('\\', '_')
+    doc_id = str(doc_id).replace('/', '_').replace('\\', '_')
     if doc_id in ['.', '..']:
         doc_id = f"dot_{doc_id}"
     doc_id = doc_id[:100].strip()
@@ -139,6 +152,7 @@ def steamid64_to_steam2(steamid64):
         return None
 
 def format_duration(seconds):
+    seconds = max(0, int(seconds))
     if seconds < 60:
         return f"{seconds}s"
     elif seconds < 3600:
@@ -222,6 +236,7 @@ class SteamID64Parser(HTMLParser):
 # Steam API
 # ============================================
 def fetch_steam_avatar(steamid):
+    """Récupère l'avatar depuis le profil Steam"""
     steam64 = steam2_to_steam64(steamid)
     if not steam64:
         return None
@@ -240,7 +255,14 @@ def fetch_steam_avatar(steamid):
         return None
 
 def find_steam_profile(pseudo, max_pages=5, timeout=15):
-    """Returns: (steam2, avatar_url) or (None, None)"""
+    """
+    Recherche un profil Steam par pseudo exact.
+    Returns: (steam2, avatar_url) or (None, None)
+    
+    - Match exact case-sensitive uniquement
+    - Rejette si plusieurs résultats identiques (doublons)
+    - Vérifie jusqu'à 5 pages
+    """
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0",
@@ -278,15 +300,17 @@ def find_steam_profile(pseudo, max_pages=5, timeout=15):
     if not p1:
         return None, None
 
+    # Match exact dans les 5 premiers résultats
     matched_href = None
     for name, href in p1[:5]:
-        if name == pseudo:
+        if name == pseudo:  # Case-sensitive!
             matched_href = href
             break
     
     if not matched_href:
         return None, None
 
+    # Vérifier les doublons
     exact_count = sum(1 for n, _ in p1 if n == pseudo)
     if exact_count > 1:
         return None, None
@@ -302,6 +326,7 @@ def find_steam_profile(pseudo, max_pages=5, timeout=15):
         except:
             break
 
+    # Extraire SteamID64
     match = re.search(r"/profiles/(\d+)", matched_href)
     steamid64 = match.group(1) if match else None
     
@@ -322,6 +347,7 @@ def find_steam_profile(pseudo, max_pages=5, timeout=15):
     if not steam2 or not STEAM2_RE.match(steam2):
         return None, None
     
+    # Récupérer avatar
     avatar_url = None
     try:
         r = s.get(f"https://steamcommunity.com/profiles/{steamid64}/?l=english", timeout=timeout)
@@ -353,13 +379,14 @@ def init_firebase():
 # Cache
 # ============================================
 def init_cache(db, france_now):
+    """Charge toutes les données au démarrage - ~200 reads"""
     global cache
     reads = 0
     today = france_now.strftime('%Y-%m-%d')
     
-    print("    📦 Chargement cache...")
+    print("    📦 Chargement...")
     
-    # Stats
+    # Stats du jour
     try:
         doc = db.collection('stats').document('daily').collection('days').document(today).get()
         reads += 1
@@ -379,7 +406,7 @@ def init_cache(db, france_now):
     except Exception as e:
         print(f"    ⚠️ Records: {e}")
     
-    # Players
+    # Tous les joueurs
     try:
         docs = db.collection('players').get()
         for doc in docs:
@@ -395,7 +422,7 @@ def init_cache(db, france_now):
     except Exception as e:
         print(f"    ⚠️ Players: {e}")
     
-    # Live status
+    # Live status (avec timestamps)
     try:
         doc = db.collection('live').document('status').get()
         reads += 1
@@ -410,8 +437,9 @@ def init_cache(db, france_now):
                 cache['prev_names'].add(name)
                 cache['prev_times'][name] = time_val
                 
-                started_at_str = p.get('session_started_at')
+                # Récupérer le timestamp sauvegardé
                 started_at = None
+                started_at_str = p.get('session_started_at')
                 if started_at_str:
                     try:
                         started_at = datetime.fromisoformat(started_at_str.replace('Z', '+00:00'))
@@ -420,13 +448,12 @@ def init_cache(db, france_now):
                 
                 found = find_player(name)
                 if found:
-                    doc_id = found[0]
                     cache['sessions'][name] = {
                         'started_at': started_at,
-                        'doc_id': doc_id
+                        'doc_id': found[0]
                     }
             
-            print(f"    🔗 {len(cache['sessions'])} sessions")
+            print(f"    🔗 {len(cache['sessions'])} sessions actives")
     except Exception as e:
         print(f"    ⚠️ Live: {e}")
     
@@ -436,6 +463,7 @@ def init_cache(db, france_now):
     return reads
 
 def find_player(name):
+    """Trouve un joueur par nom dans le cache"""
     key = name.lower().strip()
     doc_id = cache['players_by_name'].get(key) or cache['players_by_name'].get(normalize_name(name))
     if doc_id and doc_id in cache['players']:
@@ -443,6 +471,7 @@ def find_player(name):
     return None
 
 def update_player_cache(doc_id, data):
+    """Met à jour un joueur dans le cache"""
     if doc_id in cache['players']:
         cache['players'][doc_id].update(data)
     else:
@@ -456,6 +485,7 @@ def update_player_cache(doc_id, data):
 # Server Query
 # ============================================
 def query_gmod_server() -> Optional[dict]:
+    """Interroge le serveur GMod"""
     try:
         address = (GMOD_HOST, GMOD_PORT)
         info = a2s.info(address, timeout=10)
@@ -482,6 +512,20 @@ def query_gmod_server() -> Optional[dict]:
 # Core Sync - BULLETPROOF
 # ============================================
 def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime):
+    """
+    Synchronisation parfaite avec Firebase.
+    
+    Phases:
+    0. Reset serveur (temps diminué)
+    1. Recherche Steam pour nouveaux (cache résultats)
+    2. Détection changements de nom
+    3. Traitement changements de nom
+    4. Départs (sauvegarde temps)
+    5. Arrivées (utilise cache Steam)
+    6. Stayed sans session
+    7. Live/status
+    8. Stats
+    """
     global cache
     
     try:
@@ -493,6 +537,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
         
         writes = 0
         
+        # Changement de jour
         if cache['today_date'] != today:
             print(f"       🌅 Nouveau jour")
             cache['hourly_stats'] = {}
@@ -509,71 +554,104 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
         cache['is_offline'] = False
         
         # ============================================
-        # PHASE 0: Detect server reset (time decreased)
+        # PHASE 0: Détection reset serveur (temps diminué)
         # ============================================
         for name in stayed:
             prev_time = cache['prev_times'].get(name, 0)
             curr_time = current_players[name]
             
-            # Si le temps a diminué de plus de 2 minutes, c'est un reset serveur
+            # Si temps diminué de plus de 2 minutes = reset serveur
             if prev_time > curr_time + 120:
                 session = cache['sessions'].get(name)
-                if session and session.get('started_at'):
-                    # Sauvegarder le temps de l'ancienne session
+                if session and session.get('started_at') and session.get('doc_id'):
                     doc_id = sanitize_doc_id(session['doc_id'])
                     if doc_id:
+                        # Calculer et sauvegarder le temps de l'ancienne session
                         duration = int((now - session['started_at']).total_seconds())
-                        # Mais limiter au temps réel du serveur (prev_time)
-                        duration = min(duration, prev_time)
+                        # Cap: ne pas dépasser le temps connu du serveur + marge
+                        duration = min(duration, prev_time + 120)
                         duration = max(0, duration)
                         
                         if duration > 60:  # Seulement si > 1 min
                             data = cache['players'].get(doc_id, {})
                             new_total = data.get('total_time_seconds', 0) + duration
-                            db.collection('players').document(doc_id).update({
-                                'total_time_seconds': new_total
-                            })
-                            writes += 1
-                            update_player_cache(doc_id, {**data, 'total_time_seconds': new_total})
-                            print(f"          🔄 Reset serveur: {name} (+{format_duration(duration)} sauvé)")
+                            try:
+                                db.collection('players').document(doc_id).update({
+                                    'total_time_seconds': new_total
+                                })
+                                writes += 1
+                                update_player_cache(doc_id, {**data, 'total_time_seconds': new_total})
+                                print(f"          🔄 Reset: {name} (+{format_duration(duration)})")
+                            except Exception as e:
+                                print(f"          ⚠️ Reset save {name}: {e}")
                 
                 # Recalculer started_at avec le nouveau temps
-                new_started_at = now - timedelta(seconds=curr_time)
+                new_started = now - timedelta(seconds=curr_time)
                 if name in cache['sessions']:
-                    cache['sessions'][name]['started_at'] = new_started_at
+                    cache['sessions'][name]['started_at'] = new_started
         
         # ============================================
-        # PHASE 1: Detect name changes (BEFORE departures!)
+        # PHASE 1: Recherche Steam pour tous les nouveaux (cache résultats)
         # ============================================
-        name_changes = {}  # old_name -> new_name
+        steam_cache = {}  # name -> (steam2, avatar_url)
+        
+        for name in joined:
+            try:
+                steam2, avatar_url = find_steam_profile(name)
+                steam_cache[name] = (steam2, avatar_url)
+            except Exception as e:
+                steam_cache[name] = (None, None)
+                print(f"          ⚠️ Steam search {name}: {e}")
+        
+        # ============================================
+        # PHASE 2: Détection changements de nom
+        # ============================================
+        name_changes = {}  # old_name -> (new_name, doc_id, avatar_url)
         
         for new_name in list(joined):
-            try:
-                steam2, avatar_url = find_steam_profile(new_name)
-                if steam2:
-                    doc_id = sanitize_doc_id(steam2)
-                    if doc_id:
-                        for old_name in list(left):
-                            old_session = cache['sessions'].get(old_name)
-                            if old_session and old_session.get('doc_id') == doc_id:
-                                name_changes[old_name] = (new_name, doc_id, avatar_url)
-                                print(f"          🔄 Renommage: {old_name} → {new_name}")
-                                break
-            except:
-                pass
+            steam2, avatar_url = steam_cache.get(new_name, (None, None))
+            if steam2:
+                doc_id = sanitize_doc_id(steam2)
+                if doc_id:
+                    for old_name in list(left):
+                        old_session = cache['sessions'].get(old_name)
+                        if old_session and old_session.get('doc_id') == doc_id:
+                            name_changes[old_name] = (new_name, doc_id, avatar_url)
+                            print(f"          🔄 Rename: {old_name} → {new_name}")
+                            break
         
-        # Remove name changes from joined/left
-        for old_name, (new_name, doc_id, avatar_url) in name_changes.items():
+        # Retirer les renames de joined/left
+        for old_name, (new_name, _, _) in name_changes.items():
             joined.discard(new_name)
             left.discard(old_name)
         
         # ============================================
-        # PHASE 2: Handle name changes (transfer session, NO time added)
+        # PHASE 3: Traitement changements de nom (PAS de temps ajouté!)
         # ============================================
         for old_name, (new_name, doc_id, avatar_url) in name_changes.items():
             try:
                 old_session = cache['sessions'].get(old_name, {})
                 data = cache['players'].get(doc_id, {})
+                new_time = current_players[new_name]
+                
+                # Vérifier cohérence temporelle (rename + reset simultané?)
+                old_started = old_session.get('started_at')
+                if old_started:
+                    expected_duration = int((now - old_started).total_seconds())
+                    # Si le temps serveur est très différent, c'est un reset
+                    if new_time < expected_duration - 300:  # 5 min de marge
+                        # Sauvegarder l'ancien temps
+                        old_time = cache['prev_times'].get(old_name, 0)
+                        duration = min(expected_duration, old_time + 120)
+                        duration = max(0, duration)
+                        
+                        if duration > 60:
+                            new_total = data.get('total_time_seconds', 0) + duration
+                            data['total_time_seconds'] = new_total
+                            print(f"          🔄 Reset+Rename: {old_name} (+{format_duration(duration)})")
+                        
+                        # Recalculer started_at
+                        old_started = now - timedelta(seconds=new_time)
                 
                 update = {
                     'name': new_name,
@@ -581,59 +659,65 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                 }
                 if avatar_url and avatar_url != data.get('avatar_url'):
                     update['avatar_url'] = avatar_url
+                if 'total_time_seconds' in data and data['total_time_seconds'] != cache['players'].get(doc_id, {}).get('total_time_seconds'):
+                    update['total_time_seconds'] = data['total_time_seconds']
                 
                 db.collection('players').document(doc_id).update(update)
                 writes += 1
-                update_player_cache(doc_id, {**data, **update})
+                update_player_cache(doc_id, {**cache['players'].get(doc_id, {}), **update})
                 
-                # Transfer session (keep same started_at!)
+                # Transférer la session
                 cache['sessions'].pop(old_name, None)
                 cache['sessions'][new_name] = {
-                    'started_at': old_session.get('started_at'),
+                    'started_at': old_started,
                     'doc_id': doc_id
                 }
                 cache['prev_times'].pop(old_name, None)
-                cache['prev_times'][new_name] = current_players[new_name]
+                cache['prev_times'][new_name] = new_time
                 
             except Exception as e:
-                print(f"          ❌ Name change {old_name}: {e}")
+                print(f"          ❌ Rename {old_name}: {e}")
         
         # ============================================
-        # PHASE 3: Handle departures (save time)
+        # PHASE 4: Départs (sauvegarde temps)
         # ============================================
         for name in left:
             try:
                 session = cache['sessions'].get(name)
                 
                 if not session or not session.get('started_at'):
+                    # Pas de session trackée
                     existing = find_player(name)
                     if existing:
                         doc_id = sanitize_doc_id(existing[0])
                         if doc_id:
-                            db.collection('players').document(doc_id).update({
-                                'last_seen': firestore.SERVER_TIMESTAMP,
-                                'current_session_start': None
-                            })
-                            writes += 1
+                            try:
+                                db.collection('players').document(doc_id).update({
+                                    'last_seen': firestore.SERVER_TIMESTAMP,
+                                    'current_session_start': None
+                                })
+                                writes += 1
+                            except:
+                                pass
                     print(f"          👋 {name} (no session)")
                     cache['sessions'].pop(name, None)
                     cache['prev_times'].pop(name, None)
                     continue
                 
                 doc_id = sanitize_doc_id(session['doc_id'])
-                started_at = session['started_at']
-                
                 if not doc_id:
                     cache['sessions'].pop(name, None)
                     cache['prev_times'].pop(name, None)
                     continue
                 
-                # Duration = now - started_at
+                started_at = session['started_at']
+                
+                # Calculer durée
                 duration = int((now - started_at).total_seconds())
                 
-                # Safety: cap at last known time + 5 minutes (avoid huge errors)
-                last_known_time = cache['prev_times'].get(name, 0)
-                max_duration = last_known_time + 300
+                # Cap de sécurité: max = dernier temps connu + 1 intervalle + marge
+                last_known = cache['prev_times'].get(name, 0)
+                max_duration = last_known + QUERY_INTERVAL + 60
                 duration = min(duration, max_duration)
                 duration = max(0, duration)
                 
@@ -653,12 +737,12 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                 print(f"          👋 {name} (+{format_duration(duration)})")
                 
             except Exception as e:
-                print(f"          ❌ Departure {name}: {e}")
+                print(f"          ❌ Départ {name}: {e}")
                 cache['sessions'].pop(name, None)
                 cache['prev_times'].pop(name, None)
         
         # ============================================
-        # PHASE 4: Handle arrivals
+        # PHASE 5: Arrivées
         # ============================================
         for name in joined:
             try:
@@ -668,6 +752,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                 existing = find_player(name)
                 
                 if existing:
+                    # Joueur existant
                     doc_id, data = existing
                     doc_id = sanitize_doc_id(doc_id)
                     if not doc_id:
@@ -681,10 +766,12 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                         'session_count': data.get('session_count', 0) + 1
                     }
                     
+                    # Avatar manquant?
                     if steam_id.startswith('STEAM_') and not data.get('avatar_url'):
                         avatar = fetch_steam_avatar(steam_id)
                         if avatar:
                             update['avatar_url'] = avatar
+                            print(f"          🖼️ Avatar: {name}")
                     
                     db.collection('players').document(doc_id).update(update)
                     writes += 1
@@ -694,7 +781,8 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                     print(f"          ⬆️ {name} ({format_duration(session_time)})")
                     
                 else:
-                    steam2, avatar_url = find_steam_profile(name)
+                    # Nouveau joueur - utiliser le cache Steam
+                    steam2, avatar_url = steam_cache.get(name, (None, None))
                     
                     if steam2:
                         doc_id = sanitize_doc_id(steam2)
@@ -704,6 +792,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                         existing_data = cache['players'].get(doc_id)
                         
                         if existing_data:
+                            # SteamID existe (ancien joueur avec nouveau nom)
                             update = {
                                 'name': name,
                                 'last_seen': firestore.SERVER_TIMESTAMP,
@@ -718,6 +807,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                             update_player_cache(doc_id, {**existing_data, **update})
                             print(f"          🔄 {name} (steam existant)")
                         else:
+                            # Vraiment nouveau
                             new_player = {
                                 'name': name,
                                 'steam_id': doc_id,
@@ -738,6 +828,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                         
                         cache['sessions'][name] = {'started_at': started_at, 'doc_id': doc_id}
                     else:
+                        # Pas trouvé sur Steam - auto_xxx
                         key = normalize_name(name) or 'unknown'
                         doc_id = sanitize_doc_id(f"auto_{key}") or f"auto_{hash(name) & 0xFFFFFFFF}"
                         
@@ -774,10 +865,10 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                         print(f"          🆕 {name} (auto)")
                         
             except Exception as e:
-                print(f"          ❌ Arrival {name}: {e}")
+                print(f"          ❌ Arrivée {name}: {e}")
         
         # ============================================
-        # PHASE 5: Ensure STAYED players have sessions
+        # PHASE 6: Stayed sans session
         # ============================================
         for name in stayed:
             if name not in cache['sessions']:
@@ -789,12 +880,27 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                     doc_id = sanitize_doc_id(existing[0])
                     if doc_id:
                         cache['sessions'][name] = {'started_at': started_at, 'doc_id': doc_id}
+                        
+                        # Vérifier avatar
+                        data = existing[1]
+                        steam_id = data.get('steam_id', '')
+                        if steam_id.startswith('STEAM_') and not data.get('avatar_url'):
+                            try:
+                                avatar = fetch_steam_avatar(steam_id)
+                                if avatar:
+                                    db.collection('players').document(doc_id).update({'avatar_url': avatar})
+                                    writes += 1
+                                    update_player_cache(doc_id, {**data, 'avatar_url': avatar})
+                                    print(f"          🖼️ Avatar: {name}")
+                            except:
+                                pass
         
         # ============================================
-        # PHASE 6: Update live/status
+        # PHASE 7: Live/status (avec timestamps!)
         # ============================================
         players_changed = (current_names != previous_names) or (current_count != cache['prev_count'])
         
+        # Construire la liste avec timestamps absolus
         players_for_firebase = []
         for p in server_data['players']:
             name = p['name']
@@ -822,15 +928,15 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
             })
             writes += 1
         else:
-            print(f"       ⏭️ Live identique")
+            print(f"       ⏭️ Identique")
         
-        # Update cache
+        # MAJ cache
         cache['prev_names'] = current_names.copy()
         cache['prev_count'] = current_count
         cache['prev_times'] = current_players.copy()
         
         # ============================================
-        # PHASE 7: Stats
+        # PHASE 8: Stats
         # ============================================
         cached_hour = cache['hourly_stats'].get(hour, -1)
         if cached_hour == -1 or current_count > cached_hour:
@@ -867,6 +973,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
         return False
 
 def mark_offline(db):
+    """Marque le serveur offline et sauvegarde tous les temps"""
     global cache
     
     if cache['is_offline']:
@@ -879,7 +986,7 @@ def mark_offline(db):
     try:
         for name, session in list(cache['sessions'].items()):
             try:
-                if not session.get('started_at'):
+                if not session.get('started_at') or not session.get('doc_id'):
                     continue
                 
                 doc_id = sanitize_doc_id(session['doc_id'])
@@ -888,9 +995,9 @@ def mark_offline(db):
                 
                 duration = int((now - session['started_at']).total_seconds())
                 
-                # Safety cap
+                # Cap de sécurité
                 last_known = cache['prev_times'].get(name, 0)
-                duration = min(duration, last_known + 300)
+                duration = min(duration, last_known + QUERY_INTERVAL + 60)
                 duration = max(0, duration)
                 
                 data = cache['players'].get(doc_id, {})
@@ -929,7 +1036,7 @@ def mark_offline(db):
         print(f"    ❌ Offline: {e}")
 
 # ============================================
-# Signals
+# Signal Handling
 # ============================================
 def graceful_shutdown(signum, frame):
     global _db, cache
@@ -954,7 +1061,7 @@ signal.signal(signal.SIGTERM, graceful_shutdown)
 signal.signal(signal.SIGINT, graceful_shutdown)
 
 # ============================================
-# Lock
+# Workflow Lock
 # ============================================
 def acquire_lock(db):
     lock_ref = db.collection('system').document('workflow_lock')
@@ -973,7 +1080,7 @@ def acquire_lock(db):
                 
                 age = (datetime.now(timezone.utc) - lock_time).total_seconds()
                 
-                if age < 1800:
+                if age < 1800:  # 30 min
                     print(f"🔒 Lock actif ({int(age)}s)")
                     return False
                 print(f"🔓 Lock expiré ({int(age)}s)")
@@ -1003,7 +1110,7 @@ def main():
     global _db
     
     print("=" * 50)
-    print("🎮 GMod Status v20 - Bulletproof")
+    print(f"🎮 GMod Status v20 - Perfect ({QUERY_INTERVAL}s interval)")
     print("=" * 50)
     
     print("\n📡 Firebase...")
@@ -1018,10 +1125,10 @@ def main():
     france_now = get_france_time()
     init_cache(db, france_now)
     
-    print(f"\n🔄 Démarrage ({QUERIES_PER_RUN} queries)...")
+    print(f"\n🔄 Démarrage ({QUERIES_PER_RUN} x {QUERY_INTERVAL}s = {QUERIES_PER_RUN * QUERY_INTERVAL // 60}min)...")
     
     for i in range(QUERIES_PER_RUN):
-        wait_for_next_minute()
+        wait_for_next_interval()
         
         now = datetime.now(timezone.utc)
         france_now = get_france_time()

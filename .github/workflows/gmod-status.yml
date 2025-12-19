@@ -31,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
       
-      - name: Monitor Server (30 queries)
+      - name: Monitor Server (60 queries x 30s = 30min)
         timeout-minutes: 32
         env:
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
