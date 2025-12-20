@@ -96,9 +96,13 @@ cache = {
     'sessions': {},          # name -> {'started_at': datetime, 'doc_id': str}
     # Timeout tracking
     'consecutive_timeouts': 0,  # Nombre de timeouts consécutifs
+    # Activity feed (derniers 20 événements)
+    'activity_feed': [],     # [{type: 'join'/'leave', name: str, timestamp: str, duration: int}]
 }
 
 TIMEOUTS_BEFORE_OFFLINE = 4  # Attendre 4 timeouts (2min) avant de considérer offline
+MAX_ACTIVITY_FEED = 20       # Garder les 20 derniers événements
+MAX_SESSION_HISTORY = 50     # Garder les 50 dernières sessions par joueur
 
 def wait_for_next_interval():
     """Attend le prochain intervalle de 30 secondes (:00 ou :30)"""
@@ -478,6 +482,9 @@ def write_players_cache(db):
     
     players_cache = {}
     for doc_id, data in cache['players'].items():
+        # Récupérer les 10 dernières sessions pour le cache (économie d'espace)
+        session_history = data.get('session_history', [])[:10]
+        
         players_cache[doc_id] = {
             'name': data.get('name', ''),
             'steam_id': data.get('steam_id', ''),
@@ -487,6 +494,7 @@ def write_players_cache(db):
             'total_time_seconds': data.get('total_time_seconds', 0),
             'session_count': data.get('session_count', 0),
             'is_auto_detected': data.get('is_auto_detected', False),
+            'session_history': session_history,
         }
     
     try:
@@ -517,6 +525,45 @@ def update_player_cache(doc_id, data):
     if name:
         cache['players_by_name'][name.lower().strip()] = doc_id
         cache['players_by_name'][normalize_name(name)] = doc_id
+
+def add_activity_event(event_type, name, duration=0, doc_id=None):
+    """Ajoute un événement au feed d'activité"""
+    now = get_france_time()
+    event = {
+        'type': event_type,  # 'join' ou 'leave'
+        'name': name,
+        'timestamp': now.isoformat(),
+        'duration': duration,
+        'doc_id': doc_id
+    }
+    cache['activity_feed'].insert(0, event)
+    # Garder seulement les derniers événements
+    cache['activity_feed'] = cache['activity_feed'][:MAX_ACTIVITY_FEED]
+
+def add_session_to_history(doc_id, started_at, ended_at, duration):
+    """Ajoute une session à l'historique du joueur"""
+    if doc_id not in cache['players']:
+        return
+    
+    player_data = cache['players'][doc_id]
+    
+    # Récupérer ou créer l'historique
+    session_history = player_data.get('session_history', [])
+    
+    # Ajouter la nouvelle session
+    new_session = {
+        'start': started_at.isoformat() if hasattr(started_at, 'isoformat') else str(started_at),
+        'end': ended_at.isoformat() if hasattr(ended_at, 'isoformat') else str(ended_at),
+        'duration': duration
+    }
+    session_history.insert(0, new_session)
+    
+    # Limiter le nombre de sessions
+    session_history = session_history[:MAX_SESSION_HISTORY]
+    
+    # Mettre à jour le cache
+    player_data['session_history'] = session_history
+    cache['players'][doc_id] = player_data
 
 # ============================================
 # Server Query
@@ -734,6 +781,8 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                                     'current_session_start': None
                                 })
                                 writes += 1
+                                # Ajouter event même sans session
+                                add_activity_event('leave', name, 0, doc_id)
                             except:
                                 pass
                     print(f"          👋 {name} (no session)")
@@ -761,13 +810,33 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                 data = cache['players'].get(doc_id, {})
                 new_total = data.get('total_time_seconds', 0) + duration
                 
+                # Récupérer l'historique existant
+                existing_history = data.get('session_history', [])
+                
+                # Ajouter la nouvelle session à l'historique
+                new_session = {
+                    'start': started_at.isoformat(),
+                    'end': now.isoformat(),
+                    'duration': duration
+                }
+                existing_history.insert(0, new_session)
+                existing_history = existing_history[:MAX_SESSION_HISTORY]
+                
                 db.collection('players').document(doc_id).update({
                     'total_time_seconds': new_total,
                     'last_seen': firestore.SERVER_TIMESTAMP,
-                    'current_session_start': None
+                    'current_session_start': None,
+                    'session_history': existing_history
                 })
                 writes += 1
-                update_player_cache(doc_id, {**data, 'total_time_seconds': new_total})
+                update_player_cache(doc_id, {
+                    **data, 
+                    'total_time_seconds': new_total,
+                    'session_history': existing_history
+                })
+                
+                # Ajouter au feed d'activité
+                add_activity_event('leave', name, duration, doc_id)
                 
                 cache['sessions'].pop(name, None)
                 cache['prev_times'].pop(name, None)
@@ -815,6 +884,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                     update_player_cache(doc_id, {**data, **update})
                     
                     cache['sessions'][name] = {'started_at': started_at, 'doc_id': doc_id}
+                    add_activity_event('join', name, session_time, doc_id)
                     print(f"          ⬆️ {name} ({format_duration(session_time)})")
                     
                 else:
@@ -842,6 +912,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                             db.collection('players').document(doc_id).update(update)
                             writes += 1
                             update_player_cache(doc_id, {**existing_data, **update})
+                            add_activity_event('join', name, session_time, doc_id)
                             print(f"          🔄 {name} (steam existant)")
                         else:
                             # Vraiment nouveau
@@ -861,6 +932,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                             db.collection('players').document(doc_id).set(new_player)
                             writes += 1
                             update_player_cache(doc_id, new_player)
+                            add_activity_event('join', name, session_time, doc_id)
                             print(f"          🆕✅ {name}")
                         
                         cache['sessions'][name] = {'started_at': started_at, 'doc_id': doc_id}
@@ -899,6 +971,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                             update_player_cache(doc_id, new_player)
                         
                         cache['sessions'][name] = {'started_at': started_at, 'doc_id': doc_id}
+                        add_activity_event('join', name, session_time, doc_id)
                         print(f"          🆕 {name} (auto)")
                         
             except Exception as e:
@@ -946,6 +1019,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                 'map': server_data['map'],
                 'server': server_data['server_name'],
                 'players': players_for_firebase,
+                'activity_feed': cache['activity_feed'],  # Derniers événements
                 'timestamp': now.isoformat(),
                 'updatedAt': now.isoformat()
             })
