@@ -465,7 +465,39 @@ def init_cache(db, france_now):
     cache['today_date'] = today
     print(f"    📊 H{france_now.hour}, peak={cache['daily_peak']}, record={cache['record_peak']}")
     print(f"    📖 {reads} reads")
+    
+    # Écrire le cache players pour le frontend (1 seul document)
+    write_players_cache(db)
+    
     return reads
+
+def write_players_cache(db):
+    """Écrit le cache des joueurs pour le frontend"""
+    if not cache['players']:
+        return
+    
+    players_cache = {}
+    for doc_id, data in cache['players'].items():
+        players_cache[doc_id] = {
+            'name': data.get('name', ''),
+            'steam_id': data.get('steam_id', ''),
+            'roles': data.get('roles', ['Joueur']),
+            'avatar_url': data.get('avatar_url', ''),
+            'ingame_names': data.get('ingame_names', []),
+            'total_time_seconds': data.get('total_time_seconds', 0),
+            'session_count': data.get('session_count', 0),
+            'is_auto_detected': data.get('is_auto_detected', False),
+        }
+    
+    try:
+        db.collection('cache').document('players').set({
+            'players': players_cache,
+            'count': len(players_cache),
+            'updatedAt': firestore.SERVER_TIMESTAMP
+        })
+        print(f"    📦 Cache: {len(players_cache)} joueurs")
+    except Exception as e:
+        print(f"    ⚠️ Cache: {e}")
 
 def find_player(name):
     """Trouve un joueur par nom dans le cache"""
@@ -954,6 +986,14 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
             writes += 1
             print(f"       🏆 Record: {current_count}!")
         
+        # ============================================
+        # PHASE 9: Cache players (pour le frontend)
+        # ============================================
+        # Écrire le cache seulement si des joueurs ont changé (arrivées/départs)
+        if joined or left or name_changes:
+            write_players_cache(db)
+            writes += 1
+        
         print(f"       ✅ {writes}W")
         return True
         
@@ -1058,7 +1098,36 @@ def acquire_lock(db):
     lock_ref = db.collection('system').document('workflow_lock')
     
     try:
-        lock_doc = lock_ref.get()
+        # Timeout de 10 secondes pour éviter les blocages
+        import threading
+        result = [None]
+        error = [None]
+        
+        def get_lock():
+            try:
+                result[0] = lock_ref.get()
+            except Exception as e:
+                error[0] = e
+        
+        thread = threading.Thread(target=get_lock)
+        thread.start()
+        thread.join(timeout=10)
+        
+        if thread.is_alive():
+            print("    ⚠️ Timeout lecture lock (10s)")
+            # On continue quand même - on assume pas de lock
+            lock_ref.set({
+                'locked_at': firestore.SERVER_TIMESTAMP,
+                'workflow_id': os.environ.get('GITHUB_RUN_ID', 'local')
+            })
+            print("    🔐 Lock acquis (après timeout)")
+            return True
+        
+        if error[0]:
+            raise error[0]
+        
+        lock_doc = result[0]
+        
         if lock_doc.exists:
             lock_data = lock_doc.to_dict()
             locked_at = lock_data.get('locked_at')
@@ -1072,20 +1141,21 @@ def acquire_lock(db):
                 age = (datetime.now(timezone.utc) - lock_time).total_seconds()
                 
                 if age < 1800:  # 30 min
-                    print(f"🔒 Lock actif ({int(age)}s)")
+                    print(f"    🔒 Lock actif ({int(age)}s)")
                     return False
-                print(f"🔓 Lock expiré ({int(age)}s)")
+                print(f"    🔓 Lock expiré ({int(age)}s)")
         
         lock_ref.set({
             'locked_at': firestore.SERVER_TIMESTAMP,
             'workflow_id': os.environ.get('GITHUB_RUN_ID', 'local')
         })
-        print("🔐 Lock acquis")
+        print("    🔐 Lock acquis")
         return True
         
     except Exception as e:
-        print(f"⚠️ Lock: {e}")
-        return False
+        print(f"    ⚠️ Lock: {e}")
+        # En cas d'erreur, on continue quand même
+        return True
 
 def release_lock(db):
     try:
@@ -1109,6 +1179,7 @@ def main():
     _db = db
     print("    ✅ Connecté")
     
+    print("\n🔐 Vérification lock...")
     if not acquire_lock(db):
         print("❌ Autre workflow actif")
         sys.exit(0)
