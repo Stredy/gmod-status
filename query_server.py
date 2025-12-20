@@ -83,6 +83,7 @@ cache = {
     'hourly_stats': {},
     'daily_peak': 0,
     'record_peak': 0,
+    'record_valid': False,  # Flag de sécurité: True seulement si on a lu le record correctement
     'today_date': None,
     # Players database
     'players': {},           # doc_id -> player data
@@ -103,6 +104,7 @@ cache = {
 TIMEOUTS_BEFORE_OFFLINE = 4  # Attendre 4 timeouts (2min) avant de considérer offline
 MAX_ACTIVITY_FEED = 20       # Garder les 20 derniers événements
 MAX_SESSION_HISTORY = 50     # Garder les 50 dernières sessions par joueur
+MIN_RECORD_THRESHOLD = 5     # Ne jamais enregistrer un record < 5 joueurs
 
 def wait_for_next_interval():
     """Attend le prochain intervalle de 30 secondes (:00 ou :30)"""
@@ -410,14 +412,24 @@ def init_cache(db, france_now):
         doc = db.collection('stats').document('records').get()
         reads += 1
         if doc.exists:
-            cache['record_peak'] = doc.to_dict().get('peak_count', 0)
+            record_data = doc.to_dict()
+            cache['record_peak'] = record_data.get('peak_count', 0)
+            # Record valide seulement si >= seuil minimum
+            if cache['record_peak'] >= MIN_RECORD_THRESHOLD:
+                cache['record_valid'] = True
+                print(f"    ✅ Record: {cache['record_peak']}")
+            else:
+                print(f"    ⚠️ Record suspect: {cache['record_peak']}")
+        else:
+            print(f"    ⚠️ Document records inexistant")
     except Exception as e:
-        print(f"    ⚠️ Records: {e}")
+        print(f"    ❌ Records: {e}")
+        cache['record_valid'] = False
     
     # Reconstruire le record depuis les daily stats si nécessaire
-    if cache['record_peak'] < 10:  # Valeur suspecte, probablement corrompu
+    if not cache['record_valid']:
         try:
-            print(f"    🔧 Record suspect ({cache['record_peak']}), reconstruction...")
+            print(f"    🔧 Reconstruction du record...")
             days_ref = db.collection('stats').document('daily').collection('days')
             days_docs = days_ref.get()
             max_peak = 0
@@ -430,15 +442,20 @@ def init_cache(db, france_now):
                     max_date = day_doc.id
                 reads += 1
             
-            if max_peak > cache['record_peak']:
+            if max_peak >= MIN_RECORD_THRESHOLD:
                 cache['record_peak'] = max_peak
+                cache['record_valid'] = True
                 db.collection('stats').document('records').set({
                     'peak_count': max_peak,
                     'peak_date': max_date
                 })
                 print(f"    ✅ Record reconstruit: {max_peak} ({max_date})")
+            else:
+                print(f"    ⚠️ Pas de record valide trouvé (max={max_peak})")
+                # On ne valide PAS le record - pas d'écriture de nouveau record ce run
         except Exception as e:
-            print(f"    ⚠️ Reconstruction record: {e}")
+            print(f"    ❌ Reconstruction record: {e}")
+            cache['record_valid'] = False
     
     # Tous les joueurs
     try:
@@ -1077,19 +1094,26 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
         else:
             print(f"       ⏭️ H{hour}: {cached_hour}")
         
-        # Protection: ne jamais enregistrer un record < 5 joueurs (évite les erreurs de reset)
-        MIN_RECORD_THRESHOLD = 5
+        # Protection record:
+        # 1. Jamais de record < MIN_RECORD_THRESHOLD (5 joueurs)
+        # 2. Jamais si record_valid = False (on n'a pas pu le lire correctement)
+        # 3. Double vérification Firestore avant d'écraser
         
-        if current_count > cache['record_peak'] and current_count >= MIN_RECORD_THRESHOLD:
+        if not cache['record_valid']:
+            # On n'a pas pu valider le record au démarrage - on n'écrit rien
+            if current_count > cache['record_peak']:
+                print(f"       ⚠️ Record non validé, pas d'écriture ({current_count} joueurs)")
+        elif current_count > cache['record_peak'] and current_count >= MIN_RECORD_THRESHOLD:
             # Double vérification: relire le document pour éviter d'écraser un record plus haut
             try:
                 current_record_doc = db.collection('stats').document('records').get()
                 if current_record_doc.exists:
                     current_record = current_record_doc.to_dict().get('peak_count', 0)
                     if current_count <= current_record:
-                        # Le record actuel est déjà plus haut, mettre à jour le cache seulement
+                        # Le record Firestore est déjà plus haut, mettre à jour le cache seulement
                         cache['record_peak'] = current_record
-                        print(f"       ⏭️ Record déjà à {current_record}")
+                        cache['record_valid'] = True
+                        print(f"       ⏭️ Record Firestore déjà à {current_record}")
                     else:
                         # Vraiment un nouveau record
                         cache['record_peak'] = current_count
@@ -1098,18 +1122,18 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                             'peak_date': now.isoformat()
                         })
                         writes += 1
-                        print(f"       🏆 Record: {current_count}!")
+                        print(f"       🏆 NOUVEAU RECORD: {current_count} joueurs!")
                 else:
-                    # Document n'existe pas, créer seulement si >= seuil
+                    # Document n'existe pas, créer
                     cache['record_peak'] = current_count
                     db.collection('stats').document('records').set({
                         'peak_count': current_count,
                         'peak_date': now.isoformat()
                     })
                     writes += 1
-                    print(f"       🏆 Record: {current_count}!")
+                    print(f"       🏆 NOUVEAU RECORD: {current_count} joueurs!")
             except Exception as e:
-                print(f"       ⚠️ Record check: {e}")
+                print(f"       ⚠️ Record check error: {e} - pas d'écriture")
         
         # ============================================
         # PHASE 9: Cache players (pour le frontend)
