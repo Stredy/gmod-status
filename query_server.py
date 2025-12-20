@@ -482,6 +482,11 @@ def init_cache(db, france_now):
             cache['is_offline'] = not data.get('ok', True)
             cache['prev_count'] = data.get('count', 0)
             
+            # Récupérer l'activity_feed existant
+            cache['activity_feed'] = data.get('activity_feed', [])
+            if cache['activity_feed']:
+                print(f"    📜 {len(cache['activity_feed'])} événements récupérés")
+            
             for p in data.get('players', []):
                 name = p['name']
                 time_val = p.get('time', 0)
@@ -569,13 +574,21 @@ def update_player_cache(doc_id, data):
         cache['players_by_name'][name.lower().strip()] = doc_id
         cache['players_by_name'][normalize_name(name)] = doc_id
 
-def add_activity_event(event_type, name, duration=0, doc_id=None):
+def add_activity_event(event_type, name, duration=0, doc_id=None, timestamp=None):
     """Ajoute un événement au feed d'activité"""
-    now = get_france_time()
+    if timestamp is None:
+        timestamp = get_france_time()
+    
+    # Convertir en string ISO si c'est un datetime
+    if hasattr(timestamp, 'isoformat'):
+        timestamp_str = timestamp.isoformat()
+    else:
+        timestamp_str = str(timestamp)
+    
     event = {
         'type': event_type,  # 'join' ou 'leave'
         'name': name,
-        'timestamp': now.isoformat(),
+        'timestamp': timestamp_str,
         'duration': duration,
         'doc_id': doc_id
     }
@@ -927,7 +940,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                     update_player_cache(doc_id, {**data, **update})
                     
                     cache['sessions'][name] = {'started_at': started_at, 'doc_id': doc_id}
-                    add_activity_event('join', name, session_time, doc_id)
+                    add_activity_event('join', name, session_time, doc_id, timestamp=started_at)
                     print(f"          ⬆️ {name} ({format_duration(session_time)})")
                     
                 else:
@@ -955,7 +968,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                             db.collection('players').document(doc_id).update(update)
                             writes += 1
                             update_player_cache(doc_id, {**existing_data, **update})
-                            add_activity_event('join', name, session_time, doc_id)
+                            add_activity_event('join', name, session_time, doc_id, timestamp=started_at)
                             print(f"          🔄 {name} (steam existant)")
                         else:
                             # Vraiment nouveau
@@ -975,7 +988,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                             db.collection('players').document(doc_id).set(new_player)
                             writes += 1
                             update_player_cache(doc_id, new_player)
-                            add_activity_event('join', name, session_time, doc_id)
+                            add_activity_event('join', name, session_time, doc_id, timestamp=started_at)
                             print(f"          🆕✅ {name}")
                         
                         cache['sessions'][name] = {'started_at': started_at, 'doc_id': doc_id}
@@ -1014,7 +1027,7 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
                             update_player_cache(doc_id, new_player)
                         
                         cache['sessions'][name] = {'started_at': started_at, 'doc_id': doc_id}
-                        add_activity_event('join', name, session_time, doc_id)
+                        add_activity_event('join', name, session_time, doc_id, timestamp=started_at)
                         print(f"          🆕 {name} (auto)")
                         
             except Exception as e:
