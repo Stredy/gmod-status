@@ -414,6 +414,32 @@ def init_cache(db, france_now):
     except Exception as e:
         print(f"    ⚠️ Records: {e}")
     
+    # Reconstruire le record depuis les daily stats si nécessaire
+    if cache['record_peak'] < 10:  # Valeur suspecte, probablement corrompu
+        try:
+            print(f"    🔧 Record suspect ({cache['record_peak']}), reconstruction...")
+            days_ref = db.collection('stats').document('daily').collection('days')
+            days_docs = days_ref.get()
+            max_peak = 0
+            max_date = None
+            for day_doc in days_docs:
+                data = day_doc.to_dict()
+                peak = data.get('peak', 0)
+                if peak > max_peak:
+                    max_peak = peak
+                    max_date = day_doc.id
+                reads += 1
+            
+            if max_peak > cache['record_peak']:
+                cache['record_peak'] = max_peak
+                db.collection('stats').document('records').set({
+                    'peak_count': max_peak,
+                    'peak_date': max_date
+                })
+                print(f"    ✅ Record reconstruit: {max_peak} ({max_date})")
+        except Exception as e:
+            print(f"    ⚠️ Reconstruction record: {e}")
+    
     # Tous les joueurs
     try:
         docs = db.collection('players').get()
@@ -1051,14 +1077,39 @@ def sync_to_firebase(db, server_data: dict, now: datetime, france_now: datetime)
         else:
             print(f"       ⏭️ H{hour}: {cached_hour}")
         
-        if current_count > cache['record_peak']:
-            cache['record_peak'] = current_count
-            db.collection('stats').document('records').set({
-                'peak_count': current_count,
-                'peak_date': now.isoformat()
-            })
-            writes += 1
-            print(f"       🏆 Record: {current_count}!")
+        # Protection: ne jamais enregistrer un record < 5 joueurs (évite les erreurs de reset)
+        MIN_RECORD_THRESHOLD = 5
+        
+        if current_count > cache['record_peak'] and current_count >= MIN_RECORD_THRESHOLD:
+            # Double vérification: relire le document pour éviter d'écraser un record plus haut
+            try:
+                current_record_doc = db.collection('stats').document('records').get()
+                if current_record_doc.exists:
+                    current_record = current_record_doc.to_dict().get('peak_count', 0)
+                    if current_count <= current_record:
+                        # Le record actuel est déjà plus haut, mettre à jour le cache seulement
+                        cache['record_peak'] = current_record
+                        print(f"       ⏭️ Record déjà à {current_record}")
+                    else:
+                        # Vraiment un nouveau record
+                        cache['record_peak'] = current_count
+                        db.collection('stats').document('records').set({
+                            'peak_count': current_count,
+                            'peak_date': now.isoformat()
+                        })
+                        writes += 1
+                        print(f"       🏆 Record: {current_count}!")
+                else:
+                    # Document n'existe pas, créer seulement si >= seuil
+                    cache['record_peak'] = current_count
+                    db.collection('stats').document('records').set({
+                        'peak_count': current_count,
+                        'peak_date': now.isoformat()
+                    })
+                    writes += 1
+                    print(f"       🏆 Record: {current_count}!")
+            except Exception as e:
+                print(f"       ⚠️ Record check: {e}")
         
         # ============================================
         # PHASE 9: Cache players (pour le frontend)
