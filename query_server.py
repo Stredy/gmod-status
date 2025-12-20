@@ -511,6 +511,41 @@ def init_cache(db, france_now):
                     }
             
             print(f"    🔗 {len(cache['sessions'])} sessions actives")
+            
+            # Si l'activity_feed est vide mais qu'il y a des joueurs, générer des événements "join"
+            if len(cache['activity_feed']) == 0 and len(cache['sessions']) > 0:
+                print(f"    📜 Génération du feed initial...")
+                for p in data.get('players', []):
+                    name = p['name']
+                    time_val = p.get('time', 0)
+                    started_at_str = p.get('session_started_at')
+                    
+                    # Calculer le timestamp de début
+                    if started_at_str:
+                        try:
+                            started_at = datetime.fromisoformat(started_at_str.replace('Z', '+00:00'))
+                        except:
+                            started_at = france_now - timedelta(seconds=time_val)
+                    else:
+                        started_at = france_now - timedelta(seconds=time_val)
+                    
+                    found = find_player(name)
+                    doc_id = found[0] if found else None
+                    
+                    add_activity_event('join', name, time_val, doc_id, timestamp=started_at)
+                
+                # Trier par timestamp (plus récent en premier)
+                cache['activity_feed'].sort(key=lambda x: x['timestamp'], reverse=True)
+                print(f"    ✅ {len(cache['activity_feed'])} événements générés")
+                
+                # Écrire immédiatement le feed dans live/status
+                try:
+                    db.collection('live').document('status').update({
+                        'activity_feed': cache['activity_feed']
+                    })
+                    print(f"    💾 Feed sauvegardé")
+                except:
+                    pass
     except Exception as e:
         print(f"    ⚠️ Live: {e}")
     
