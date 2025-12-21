@@ -596,7 +596,9 @@ def reload_players_from_firestore(db):
                 cache['players_by_name'][normalize_name(name)] = doc_id
         
         # Réinitialiser les sessions en cours pour qu'elles démarrent maintenant
-        # ET incrémenter session_count pour les joueurs avec session active
+        # NOTE: NE PAS incrémenter session_count ici!
+        # La session était déjà comptée à l'arrivée initiale du joueur.
+        # On reset juste le started_at pour que le temps post-reset soit comptabilisé.
         now = get_france_time()
         sessions_updated = 0
         
@@ -605,18 +607,10 @@ def reload_players_from_firestore(db):
             doc_id = session.get('doc_id')
             if doc_id and doc_id in cache['players']:
                 try:
-                    # Incrémenter session_count (car c'est une nouvelle session post-reset)
-                    data = cache['players'][doc_id]
-                    new_count = data.get('session_count', 0) + 1
-                    
                     db.collection('players').document(doc_id).update({
-                        'current_session_start': now.isoformat(),
-                        'session_count': new_count,
-                        'last_seen': firestore.SERVER_TIMESTAMP
+                        'current_session_start': now.isoformat()
+                        # PAS de session_count - déjà incrémenté à l'arrivée
                     })
-                    
-                    # Mettre à jour le cache local
-                    cache['players'][doc_id]['session_count'] = new_count
                     sessions_updated += 1
                 except:
                     pass
@@ -697,12 +691,15 @@ def finalize_session(db, name, doc_id, started_at, ended_at, writes):
     existing_history = existing_history[:MAX_SESSION_HISTORY]
     
     # Mettre à jour Firestore
+    # IMPORTANT: Synchroniser session_count avec session_history.length
+    # pour garantir la cohérence (session_count = nombre de sessions terminées)
     try:
         db.collection('players').document(doc_id).update({
             'total_time_seconds': new_total,
             'last_seen': firestore.SERVER_TIMESTAMP,
             'current_session_start': None,
-            'session_history': existing_history
+            'session_history': existing_history,
+            'session_count': len(existing_history)  # Toujours cohérent
         })
         writes += 1
         
@@ -710,7 +707,8 @@ def finalize_session(db, name, doc_id, started_at, ended_at, writes):
         update_player_cache(doc_id, {
             **data,
             'total_time_seconds': new_total,
-            'session_history': existing_history
+            'session_history': existing_history,
+            'session_count': len(existing_history)
         })
         
         # Ajouter au feed d'activité
@@ -755,7 +753,9 @@ def write_players_cache(db):
     
     # Ensuite, mettre à jour avec les données du backend
     for doc_id, data in cache['players'].items():
-        session_history = data.get('session_history', [])[:10]
+        # Garder 30 sessions dans le cache (couvre ~1 mois d'activité)
+        # Permet un calcul fiable des joueurs uniques (7j)
+        session_history = data.get('session_history', [])[:30]
         
         # Calculer last_played à partir de session_history
         # C'est la date de fin de la dernière session
