@@ -430,12 +430,15 @@ def check_and_handle_reset(db):
         reset_at_str = data.get('reset_at')
         
         if not reset_at_str:
+            # Document existe mais pas de timestamp, le supprimer
+            db.collection('system').document('reset').delete()
             return False
         
         # Parser le timestamp
         try:
             reset_at = datetime.fromisoformat(reset_at_str.replace('Z', '+00:00'))
         except:
+            db.collection('system').document('reset').delete()
             return False
         
         # Comparer avec le démarrage du run
@@ -450,8 +453,10 @@ def check_and_handle_reset(db):
             db.collection('system').document('reset').delete()
             
             return True
-        
-        return False
+        else:
+            # Reset ancien (avant ce run), juste supprimer le document
+            db.collection('system').document('reset').delete()
+            return False
         
     except Exception as e:
         # Silencieux - pas grave si on ne peut pas vérifier
@@ -845,6 +850,15 @@ def run_sync(db):
     print("\n📦 INIT")
     reads, writes = init_cache(db, france_now)
     
+    # Supprimer tout document reset résiduel
+    try:
+        reset_doc = db.collection('system').document('reset').get()
+        if reset_doc.exists:
+            db.collection('system').document('reset').delete()
+            print("    🧹 Document reset nettoyé")
+    except:
+        pass
+    
     # Query initial pour détecter les départs manqués
     print("\n🔍 DÉTECTION DÉPARTS MANQUÉS")
     initial_data = query_server()
@@ -852,7 +866,7 @@ def run_sync(db):
         current_players = initial_data.get('players', {})
         writes += detect_missed_departures(db, current_players, france_now)
         
-        # Générer le feed initial si vide
+        # Générer le feed initial si vide ET créer les sessions
         if len(cache['activity_feed']) == 0 and len(current_players) > 0:
             print(f"    📜 Génération du feed initial...")
             now = get_france_time()
@@ -861,9 +875,14 @@ def run_sync(db):
                 found = find_player(name)
                 doc_id = found[0] if found else None
                 add_activity_event('join', name, time_val, doc_id, timestamp=started_at)
+                
+                # IMPORTANT: Créer la session pour éviter le doublon dans la boucle
+                if doc_id:
+                    cache['sessions'][name] = {'started_at': started_at, 'doc_id': doc_id}
+                cache['prev_times'][name] = time_val
             
             cache['activity_feed'].sort(key=lambda x: x['timestamp'], reverse=True)
-            print(f"    ✅ {len(cache['activity_feed'])} événements générés")
+            print(f"    ✅ {len(cache['activity_feed'])} événements générés, {len(cache['sessions'])} sessions créées")
             
             # Sauvegarder immédiatement
             try:
