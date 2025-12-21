@@ -851,11 +851,13 @@ def run_sync(db):
     reads, writes = init_cache(db, france_now)
     
     # Supprimer tout document reset résiduel
+    just_reset = False
     try:
         reset_doc = db.collection('system').document('reset').get()
         if reset_doc.exists:
             db.collection('system').document('reset').delete()
-            print("    🧹 Document reset nettoyé")
+            just_reset = True
+            print("    🧹 Document reset nettoyé - mode post-reset")
     except:
         pass
     
@@ -865,24 +867,49 @@ def run_sync(db):
     if initial_data['ok']:
         current_players = initial_data.get('players', {})
         writes += detect_missed_departures(db, current_players, france_now)
+        now = get_france_time()
+        
+        # Si post-reset, incrémenter session_count pour tous les joueurs présents
+        if just_reset and len(current_players) > 0:
+            print(f"    🔄 Post-reset: incrémentation des sessions...")
+            for name, time_val in current_players.items():
+                found = find_player(name)
+                if found:
+                    doc_id = found[0]
+                    started_at = now - timedelta(seconds=time_val)
+                    try:
+                        data = cache['players'].get(doc_id, {})
+                        new_count = data.get('session_count', 0) + 1
+                        db.collection('players').document(doc_id).update({
+                            'session_count': new_count,
+                            'current_session_start': started_at.isoformat(),
+                            'last_seen': firestore.SERVER_TIMESTAMP
+                        })
+                        writes += 1
+                        if doc_id in cache['players']:
+                            cache['players'][doc_id]['session_count'] = new_count
+                        print(f"        ✅ {name}: session #{new_count}")
+                    except Exception as e:
+                        print(f"        ⚠️ {name}: {e}")
         
         # Générer le feed initial si vide ET créer les sessions
         if len(cache['activity_feed']) == 0 and len(current_players) > 0:
             print(f"    📜 Génération du feed initial...")
-            now = get_france_time()
             for name, time_val in current_players.items():
                 started_at = now - timedelta(seconds=time_val)
                 found = find_player(name)
                 doc_id = found[0] if found else None
+                
                 add_activity_event('join', name, time_val, doc_id, timestamp=started_at)
                 
-                # IMPORTANT: Créer la session pour éviter le doublon dans la boucle
-                if doc_id:
+                # Créer la session si elle n'existe pas
+                if name not in cache['sessions'] and doc_id:
                     cache['sessions'][name] = {'started_at': started_at, 'doc_id': doc_id}
+                
                 cache['prev_times'][name] = time_val
             
             cache['activity_feed'].sort(key=lambda x: x['timestamp'], reverse=True)
-            print(f"    ✅ {len(cache['activity_feed'])} événements générés, {len(cache['sessions'])} sessions créées")
+            print(f"    ✅ {len(cache['activity_feed'])} événements générés")
             
             # Sauvegarder immédiatement
             try:
