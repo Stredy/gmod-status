@@ -152,6 +152,26 @@ def format_duration(seconds):
         return f"{hours}h{minutes:02d}"
     return f"{minutes}m"
 
+def validate_player_name(name):
+    """Valide un nom de joueur"""
+    if not name:
+        return False
+    if len(name) > 64:
+        return False
+    if name.isspace():
+        return False
+    return True
+
+def validate_player_time(time_val):
+    """Valide un temps de connexion"""
+    if time_val is None:
+        return False
+    if time_val < 0:
+        return False
+    if time_val > 86400 * 7:  # Max 7 jours
+        return False
+    return True
+
 def normalize_name(name):
     """Normalise un nom pour la recherche"""
     if not name:
@@ -459,13 +479,17 @@ def release_lock(db):
 # Player lookup
 # ============================================
 def find_player(name):
-    """Trouve un joueur par nom dans le cache"""
+    """Trouve un joueur par nom Steam dans le cache"""
     if not name:
         return None
     key = name.lower().strip()
-    doc_id = cache['players_by_name'].get(key) or cache['players_by_name'].get(normalize_name(name))
+    normalized = normalize_name(name)
+    
+    # Recherche par nom Steam uniquement
+    doc_id = cache['players_by_name'].get(key) or cache['players_by_name'].get(normalized)
     if doc_id and doc_id in cache['players']:
         return (doc_id, cache['players'][doc_id])
+    
     return None
 
 def update_player_cache(doc_id, data):
@@ -572,27 +596,67 @@ def reload_players_from_firestore(db):
                 cache['players_by_name'][normalize_name(name)] = doc_id
         
         # Réinitialiser les sessions en cours pour qu'elles démarrent maintenant
-        # (ainsi le temps après reset sera comptabilisé, pas le temps avant)
+        # ET incrémenter session_count pour les joueurs avec session active
         now = get_france_time()
+        sessions_updated = 0
+        
         for name, session in cache['sessions'].items():
             session['started_at'] = now
             doc_id = session.get('doc_id')
-            if doc_id:
-                # Mettre à jour le current_session_start dans Firestore
+            if doc_id and doc_id in cache['players']:
                 try:
+                    # Incrémenter session_count (car c'est une nouvelle session post-reset)
+                    data = cache['players'][doc_id]
+                    new_count = data.get('session_count', 0) + 1
+                    
                     db.collection('players').document(doc_id).update({
-                        'current_session_start': now.isoformat()
+                        'current_session_start': now.isoformat(),
+                        'session_count': new_count,
+                        'last_seen': firestore.SERVER_TIMESTAMP
                     })
+                    
+                    # Mettre à jour le cache local
+                    cache['players'][doc_id]['session_count'] = new_count
+                    sessions_updated += 1
                 except:
                     pass
         
         # Réinitialiser prev_times (sera recalculé au prochain query)
         cache['prev_times'].clear()
         
-        # Vider l'activity feed (les anciens événements ne sont plus pertinents)
+        # Vider l'activity feed et régénérer pour les joueurs en ligne
         cache['activity_feed'].clear()
+        for name, session in cache['sessions'].items():
+            doc_id = session.get('doc_id')
+            add_activity_event('join', name, 0, doc_id, timestamp=now)
         
-        print(f"       ✅ {len(cache['players'])} joueurs rechargés, {len(cache['sessions'])} sessions réinitialisées")
+        # Mettre à jour live/status immédiatement
+        online_players = []
+        for name, session in cache['sessions'].items():
+            doc_id = session.get('doc_id')
+            online_players.append({
+                'name': name,
+                'time': 0,  # Temps reset à 0
+                'doc_id': doc_id,
+                'session_started_at': now.isoformat()
+            })
+        
+        try:
+            db.collection('live').document('status').set({
+                'ok': True,
+                'count': len(online_players),
+                'players': online_players,
+                'activity_feed': cache['activity_feed'],
+                'timestamp': now.isoformat(),
+                'updatedAt': now.isoformat()
+            })
+        except:
+            pass
+        
+        # Mettre à jour cache/players
+        write_players_cache(db)
+        
+        print(f"       ✅ {len(cache['players'])} joueurs rechargés, {sessions_updated} sessions réinitialisées")
         
     except Exception as e:
         print(f"       ⚠️ Erreur rechargement: {e}")
@@ -665,7 +729,8 @@ def write_players_cache(db):
     """Écrit le cache des joueurs pour le frontend (1 seul document)
     
     IMPORTANT: Lit d'abord les données existantes pour préserver les champs
-    modifiés par le frontend (roles, ingame_names) qui ne sont pas gérés par le backend.
+    modifiés par le frontend (roles, ingame_names, steam_id) qui ne sont pas gérés par le backend.
+    Préserve aussi les joueurs créés par le frontend que le backend ne connaît pas.
     """
     if not cache['players']:
         return
@@ -679,17 +744,26 @@ def write_players_cache(db):
     except:
         pass
     
+    # Commencer avec les joueurs existants du frontend (pour ne pas les perdre)
     players_cache = {}
+    
+    # D'abord, garder tous les joueurs du frontend que le backend ne connaît pas
+    for doc_id, existing_data in existing_cache.items():
+        if doc_id not in cache['players']:
+            # Joueur créé par le frontend (scanner, etc.) - le garder tel quel
+            players_cache[doc_id] = existing_data
+    
+    # Ensuite, mettre à jour avec les données du backend
     for doc_id, data in cache['players'].items():
         session_history = data.get('session_history', [])[:10]
         
-        # Préserver roles et ingame_names du cache existant si présents
+        # Préserver certains champs du cache existant si présents
         # (au cas où le frontend les a modifiés pendant ce run)
         existing = existing_cache.get(doc_id, {})
         
         players_cache[doc_id] = {
-            'name': data.get('name', ''),
-            'steam_id': data.get('steam_id', ''),
+            'name': data.get('name', '') or existing.get('name', ''),
+            'steam_id': existing.get('steam_id') or data.get('steam_id', ''),  # Préférer le frontend
             # Préférer les valeurs existantes du cache pour ces champs
             'roles': existing.get('roles') or data.get('roles', ['Joueur']),
             'avatar_url': data.get('avatar_url', '') or existing.get('avatar_url', ''),
@@ -927,8 +1001,16 @@ def query_server():
         
         player_data = {}
         for p in players:
-            if p.name and p.name.strip():
-                player_data[p.name] = max(0, int(p.duration))
+            name = p.name
+            time_val = int(p.duration) if p.duration else 0
+            
+            # Validation des données
+            if not validate_player_name(name):
+                continue
+            if not validate_player_time(time_val):
+                time_val = 0
+            
+            player_data[name] = max(0, time_val)
         
         return {
             'ok': True,
@@ -1404,7 +1486,13 @@ def run_sync(db):
         players_for_firebase = []
         for name, time_val in current_players.items():
             session = cache['sessions'].get(name)
-            entry = {'name': name, 'time': time_val}
+            doc_id = session.get('doc_id') if session else None
+            
+            entry = {
+                'name': name, 
+                'time': time_val,
+                'doc_id': doc_id
+            }
             
             if session and session.get('started_at'):
                 entry['session_started_at'] = session['started_at'].isoformat()
