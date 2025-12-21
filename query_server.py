@@ -962,10 +962,28 @@ def run_sync(db):
         # Si post-reset, NE PAS finaliser les sessions (elles datent d'avant le reset)
         if just_reset:
             print(f"    ⏭️ Skip (post-reset) - les sessions précédentes ne comptent pas")
+            
+            # IMPORTANT: Recharger les données des joueurs depuis Firestore
+            # car init_cache() a pu charger des données avant que le reset soit complet
+            print(f"    🔄 Rechargement des données post-reset...")
+            cache['players'].clear()
+            cache['players_by_name'].clear()
+            docs = db.collection('players').get()
+            for doc in docs:
+                data = doc.to_dict()
+                doc_id = doc.id
+                cache['players'][doc_id] = data
+                name = data.get('name', '')
+                if name:
+                    cache['players_by_name'][name.lower().strip()] = doc_id
+                    cache['players_by_name'][normalize_name(name)] = doc_id
+            print(f"    ✅ {len(cache['players'])} joueurs rechargés depuis Firestore")
+            
             # Vider les sessions du cache (elles sont invalides)
             cache['sessions'].clear()
             cache['prev_players'].clear()
             cache['prev_times'].clear()
+            cache['activity_feed'].clear()
             
             # Incrémenter session_count pour tous les joueurs présents
             if len(current_players) > 0:
@@ -986,12 +1004,46 @@ def run_sync(db):
                             writes += 1
                             if doc_id in cache['players']:
                                 cache['players'][doc_id]['session_count'] = new_count
+                            
+                            # Créer la session
+                            cache['sessions'][name] = {'started_at': started_at, 'doc_id': doc_id}
+                            cache['prev_times'][name] = time_val
+                            
+                            # Ajouter au feed
+                            add_activity_event('join', name, time_val, doc_id, timestamp=started_at)
+                            
                             print(f"        ✅ {name}: session #{new_count}")
                         except Exception as e:
                             print(f"        ⚠️ {name}: {e}")
+            
+            # Mettre à jour live/status IMMÉDIATEMENT avec les vrais joueurs en ligne
+            online_players = []
+            for name, time_val in current_players.items():
+                found = find_player(name)
+                doc_id = found[0] if found else None
+                session = cache['sessions'].get(name)
+                started_at = session['started_at'] if session else now - timedelta(seconds=time_val)
                 
-                # Mettre à jour le cache pour le frontend
-                write_players_cache(db)
+                online_players.append({
+                    'name': name,
+                    'time': time_val,
+                    'doc_id': doc_id,
+                    'session_started_at': started_at.isoformat()
+                })
+            
+            db.collection('live').document('status').set({
+                'ok': True,
+                'count': len(current_players),
+                'players': online_players,
+                'activity_feed': cache['activity_feed'],
+                'timestamp': now.isoformat(),
+                'updatedAt': now.isoformat()
+            })
+            writes += 1
+            print(f"    📡 live/status mis à jour: {len(online_players)} joueurs en ligne")
+            
+            # Mettre à jour le cache pour le frontend
+            write_players_cache(db)
         else:
             # Mode normal: détecter les départs manqués
             writes += detect_missed_departures(db, current_players, now)
