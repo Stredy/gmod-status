@@ -102,6 +102,9 @@ cache = {
     # Tracking
     'consecutive_timeouts': 0,
     'activity_feed': [],
+    
+    # Reset detection
+    'run_started_at': None,  # Timestamp de démarrage du run
 }
 
 # ============================================
@@ -408,6 +411,95 @@ def add_activity_event(event_type, name, duration=0, doc_id=None, timestamp=None
     
     cache['activity_feed'].insert(0, event)
     cache['activity_feed'] = cache['activity_feed'][:MAX_ACTIVITY_FEED]
+
+# ============================================
+# Reset Detection
+# ============================================
+def check_and_handle_reset(db):
+    """
+    Vérifie si un reset a été effectué depuis le frontend.
+    Si oui, recharge les données depuis Firestore.
+    Retourne True si un reset a été détecté.
+    """
+    try:
+        doc = db.collection('system').document('reset').get()
+        if not doc.exists:
+            return False
+        
+        data = doc.to_dict()
+        reset_at_str = data.get('reset_at')
+        
+        if not reset_at_str:
+            return False
+        
+        # Parser le timestamp
+        try:
+            reset_at = datetime.fromisoformat(reset_at_str.replace('Z', '+00:00'))
+        except:
+            return False
+        
+        # Comparer avec le démarrage du run
+        if cache['run_started_at'] and reset_at > cache['run_started_at']:
+            print(f"       🔄 RESET détecté! Rechargement des données...")
+            reload_players_from_firestore(db)
+            
+            # Mettre à jour run_started_at pour ne pas re-détecter
+            cache['run_started_at'] = get_france_time()
+            
+            # Supprimer le flag de reset
+            db.collection('system').document('reset').delete()
+            
+            return True
+        
+        return False
+        
+    except Exception as e:
+        # Silencieux - pas grave si on ne peut pas vérifier
+        return False
+
+def reload_players_from_firestore(db):
+    """Recharge toutes les données des joueurs depuis Firestore après un reset"""
+    try:
+        # Vider le cache des joueurs
+        cache['players'].clear()
+        cache['players_by_name'].clear()
+        
+        # Recharger les joueurs
+        docs = db.collection('players').get()
+        for doc in docs:
+            data = doc.to_dict()
+            doc_id = doc.id
+            cache['players'][doc_id] = data
+            name = data.get('name', '')
+            if name:
+                cache['players_by_name'][name.lower().strip()] = doc_id
+                cache['players_by_name'][normalize_name(name)] = doc_id
+        
+        # Réinitialiser les sessions en cours pour qu'elles démarrent maintenant
+        # (ainsi le temps après reset sera comptabilisé, pas le temps avant)
+        now = get_france_time()
+        for name, session in cache['sessions'].items():
+            session['started_at'] = now
+            doc_id = session.get('doc_id')
+            if doc_id:
+                # Mettre à jour le current_session_start dans Firestore
+                try:
+                    db.collection('players').document(doc_id).update({
+                        'current_session_start': now.isoformat()
+                    })
+                except:
+                    pass
+        
+        # Réinitialiser prev_times (sera recalculé au prochain query)
+        cache['prev_times'].clear()
+        
+        # Vider l'activity feed (les anciens événements ne sont plus pertinents)
+        cache['activity_feed'].clear()
+        
+        print(f"       ✅ {len(cache['players'])} joueurs rechargés, {len(cache['sessions'])} sessions réinitialisées")
+        
+    except Exception as e:
+        print(f"       ⚠️ Erreur rechargement: {e}")
 
 # ============================================
 # Session Management
@@ -743,6 +835,8 @@ def run_sync(db):
     global running
     
     france_now = get_france_time()
+    cache['run_started_at'] = france_now  # Pour détecter les resets
+    
     print(f"\n🚀 GMod Monitor v21 - {france_now.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"    Serveur: {SERVER_IP}:{SERVER_PORT}")
     print(f"    Intervalle: {QUERY_INTERVAL}s, Max queries: {MAX_QUERIES}")
@@ -792,6 +886,9 @@ def run_sync(db):
         now = get_france_time()
         today = now.strftime('%Y-%m-%d')
         hour = now.hour
+        
+        # Vérifier si un reset a été effectué depuis le frontend
+        check_and_handle_reset(db)
         
         # Changement de jour ?
         if today != cache['today_date']:
