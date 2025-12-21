@@ -62,7 +62,7 @@ SERVER_IP = "poudlardmc.fr"
 SERVER_PORT = 27015
 
 # Seuils et limites
-TIMEOUTS_BEFORE_OFFLINE = 4  # 4 timeouts (2 min) avant de considérer offline
+TIMEOUTS_BEFORE_OFFLINE = 3  # 3 timeouts (1m30) avant de considérer offline
 MAX_ACTIVITY_FEED = 20       # Garder les 20 derniers événements
 MAX_SESSION_HISTORY = 50     # Garder les 50 dernières sessions par joueur
 MIN_RECORD_THRESHOLD = 5     # Jamais de record < 5 joueurs
