@@ -957,34 +957,44 @@ def run_sync(db):
     initial_data = query_server()
     if initial_data['ok']:
         current_players = initial_data.get('players', {})
-        writes += detect_missed_departures(db, current_players, france_now)
         now = get_france_time()
         
-        # Si post-reset, incrémenter session_count pour tous les joueurs présents
-        if just_reset and len(current_players) > 0:
-            print(f"    🔄 Post-reset: incrémentation des sessions...")
-            for name, time_val in current_players.items():
-                found = find_player(name)
-                if found:
-                    doc_id = found[0]
-                    started_at = now - timedelta(seconds=time_val)
-                    try:
-                        data = cache['players'].get(doc_id, {})
-                        new_count = data.get('session_count', 0) + 1
-                        db.collection('players').document(doc_id).update({
-                            'session_count': new_count,
-                            'current_session_start': started_at.isoformat(),
-                            'last_seen': firestore.SERVER_TIMESTAMP
-                        })
-                        writes += 1
-                        if doc_id in cache['players']:
-                            cache['players'][doc_id]['session_count'] = new_count
-                        print(f"        ✅ {name}: session #{new_count}")
-                    except Exception as e:
-                        print(f"        ⚠️ {name}: {e}")
+        # Si post-reset, NE PAS finaliser les sessions (elles datent d'avant le reset)
+        if just_reset:
+            print(f"    ⏭️ Skip (post-reset) - les sessions précédentes ne comptent pas")
+            # Vider les sessions du cache (elles sont invalides)
+            cache['sessions'].clear()
+            cache['prev_players'].clear()
+            cache['prev_times'].clear()
             
-            # Mettre à jour le cache pour le frontend
-            write_players_cache(db)
+            # Incrémenter session_count pour tous les joueurs présents
+            if len(current_players) > 0:
+                print(f"    🔄 Post-reset: incrémentation des sessions...")
+                for name, time_val in current_players.items():
+                    found = find_player(name)
+                    if found:
+                        doc_id = found[0]
+                        started_at = now - timedelta(seconds=time_val)
+                        try:
+                            data = cache['players'].get(doc_id, {})
+                            new_count = data.get('session_count', 0) + 1
+                            db.collection('players').document(doc_id).update({
+                                'session_count': new_count,
+                                'current_session_start': started_at.isoformat(),
+                                'last_seen': firestore.SERVER_TIMESTAMP
+                            })
+                            writes += 1
+                            if doc_id in cache['players']:
+                                cache['players'][doc_id]['session_count'] = new_count
+                            print(f"        ✅ {name}: session #{new_count}")
+                        except Exception as e:
+                            print(f"        ⚠️ {name}: {e}")
+                
+                # Mettre à jour le cache pour le frontend
+                write_players_cache(db)
+        else:
+            # Mode normal: détecter les départs manqués
+            writes += detect_missed_departures(db, current_players, now)
         
         # Générer le feed initial si vide ET créer les sessions
         if len(cache['activity_feed']) == 0 and len(current_players) > 0:
