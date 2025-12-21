@@ -662,20 +662,38 @@ def finalize_session(db, name, doc_id, started_at, ended_at, writes):
 # Cache Players pour Frontend
 # ============================================
 def write_players_cache(db):
-    """Écrit le cache des joueurs pour le frontend (1 seul document)"""
+    """Écrit le cache des joueurs pour le frontend (1 seul document)
+    
+    IMPORTANT: Lit d'abord les données existantes pour préserver les champs
+    modifiés par le frontend (roles, ingame_names) qui ne sont pas gérés par le backend.
+    """
     if not cache['players']:
         return
+    
+    # Lire les données existantes pour préserver les modifications du frontend
+    existing_cache = {}
+    try:
+        doc = db.collection('cache').document('players').get()
+        if doc.exists:
+            existing_cache = doc.to_dict().get('players', {})
+    except:
+        pass
     
     players_cache = {}
     for doc_id, data in cache['players'].items():
         session_history = data.get('session_history', [])[:10]
         
+        # Préserver roles et ingame_names du cache existant si présents
+        # (au cas où le frontend les a modifiés pendant ce run)
+        existing = existing_cache.get(doc_id, {})
+        
         players_cache[doc_id] = {
             'name': data.get('name', ''),
             'steam_id': data.get('steam_id', ''),
-            'roles': data.get('roles', ['Joueur']),
-            'avatar_url': data.get('avatar_url', ''),
-            'ingame_names': data.get('ingame_names', []),
+            # Préférer les valeurs existantes du cache pour ces champs
+            'roles': existing.get('roles') or data.get('roles', ['Joueur']),
+            'avatar_url': data.get('avatar_url', '') or existing.get('avatar_url', ''),
+            'ingame_names': existing.get('ingame_names') if existing.get('ingame_names') else data.get('ingame_names', []),
             'total_time_seconds': data.get('total_time_seconds', 0),
             'session_count': data.get('session_count', 0),
             'is_auto_detected': data.get('is_auto_detected', False),
