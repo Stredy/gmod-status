@@ -757,6 +757,14 @@ def write_players_cache(db):
     for doc_id, data in cache['players'].items():
         session_history = data.get('session_history', [])[:10]
         
+        # Calculer last_played à partir de session_history
+        # C'est la date de fin de la dernière session
+        last_played = None
+        if session_history and len(session_history) > 0:
+            last_session = session_history[0]
+            if last_session.get('end'):
+                last_played = last_session['end']
+        
         # Préserver certains champs du cache existant si présents
         # (au cas où le frontend les a modifiés pendant ce run)
         existing = existing_cache.get(doc_id, {})
@@ -772,6 +780,7 @@ def write_players_cache(db):
             'session_count': data.get('session_count', 0),
             'is_auto_detected': data.get('is_auto_detected', False),
             'session_history': session_history,
+            'last_played': last_played,  # Date ISO de la dernière session
         }
     
     try:
