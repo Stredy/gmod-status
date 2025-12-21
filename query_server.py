@@ -891,6 +891,9 @@ def run_sync(db):
                         print(f"        ✅ {name}: session #{new_count}")
                     except Exception as e:
                         print(f"        ⚠️ {name}: {e}")
+            
+            # Mettre à jour le cache pour le frontend
+            write_players_cache(db)
         
         # Générer le feed initial si vide ET créer les sessions
         if len(cache['activity_feed']) == 0 and len(current_players) > 0:
