@@ -58,8 +58,8 @@ except ImportError:
 # ============================================
 QUERY_INTERVAL = 30          # Secondes entre chaque query
 MAX_QUERIES = 60             # Nombre de queries par run (30 min)
-SERVER_IP = "poudlardmc.fr"
-SERVER_PORT = 27015
+SERVER_IP = os.environ.get('GMOD_HOST', '51.91.215.65')
+SERVER_PORT = int(os.environ.get('GMOD_PORT', '27015'))
 
 # Seuils et limites
 TIMEOUTS_BEFORE_OFFLINE = 3  # 3 timeouts (1m30) avant de considérer offline
@@ -904,32 +904,37 @@ def run_sync(db):
         
         if not server_data['ok']:
             cache['consecutive_timeouts'] += 1
-            print(f"       ⏱️ Timeout ({cache['consecutive_timeouts']}/{TIMEOUTS_BEFORE_OFFLINE})")
             
-            if cache['consecutive_timeouts'] >= TIMEOUTS_BEFORE_OFFLINE and not cache['is_offline']:
-                cache['is_offline'] = True
-                print(f"       🔴 Serveur hors ligne")
+            if cache['is_offline']:
+                # Déjà offline, pas besoin de re-afficher
+                print(f"       ⏱️ Toujours hors ligne...")
+            else:
+                print(f"       ⏱️ Timeout ({cache['consecutive_timeouts']}/{TIMEOUTS_BEFORE_OFFLINE})")
                 
-                # Finaliser toutes les sessions
-                for name, session in list(cache['sessions'].items()):
-                    doc_id = session.get('doc_id')
-                    started_at = session.get('started_at')
-                    if doc_id and started_at:
-                        total_writes = finalize_session(db, name, doc_id, started_at, now, total_writes)
-                
-                cache['sessions'].clear()
-                cache['prev_times'].clear()
-                
-                # Écrire statut offline
-                db.collection('live').document('status').set({
-                    'ok': False,
-                    'count': 0,
-                    'players': [],
-                    'activity_feed': cache['activity_feed'],
-                    'timestamp': now.isoformat(),
-                    'updatedAt': now.isoformat()
-                })
-                total_writes += 1
+                if cache['consecutive_timeouts'] >= TIMEOUTS_BEFORE_OFFLINE:
+                    cache['is_offline'] = True
+                    print(f"       🔴 Serveur hors ligne")
+                    
+                    # Finaliser toutes les sessions
+                    for name, session in list(cache['sessions'].items()):
+                        doc_id = session.get('doc_id')
+                        started_at = session.get('started_at')
+                        if doc_id and started_at:
+                            total_writes = finalize_session(db, name, doc_id, started_at, now, total_writes)
+                    
+                    cache['sessions'].clear()
+                    cache['prev_times'].clear()
+                    
+                    # Écrire statut offline
+                    db.collection('live').document('status').set({
+                        'ok': False,
+                        'count': 0,
+                        'players': [],
+                        'activity_feed': cache['activity_feed'],
+                        'timestamp': now.isoformat(),
+                        'updatedAt': now.isoformat()
+                    })
+                    total_writes += 1
             
             wait_for_next_interval()
             continue
