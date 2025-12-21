@@ -173,20 +173,96 @@ def sanitize_doc_id(doc_id):
 # ============================================
 # Steam API
 # ============================================
+STEAMID64_BASE = 76561197960265728
+STEAM2_RE = re.compile(r"^STEAM_[0-5]:([0-1]):(\d+)$", re.IGNORECASE)
+
+def steam2_to_steamid64(steamid):
+    """Convertit STEAM_0:0:123456789 en SteamID64"""
+    if not steamid:
+        return None
+    steamid = steamid.strip()
+    if steamid.isdigit() and len(steamid) >= 16:
+        return steamid
+    m = STEAM2_RE.match(steamid)
+    if not m:
+        return None
+    x = int(m.group(1))
+    z = int(m.group(2))
+    accountid = 2 * z + x
+    return str(STEAMID64_BASE + accountid)
+
+class SteamAvatarParser(HTMLParser):
+    """Parse la page profil Steam pour extraire l'avatar"""
+    def __init__(self):
+        super().__init__()
+        self.in_inner = 0
+        self.in_frame = 0
+        self.animated = None
+        self.static_candidates = []
+
+    def _first_url_from_srcset(self, srcset):
+        if not srcset:
+            return None
+        first = srcset.split(",")[0].strip()
+        if not first:
+            return None
+        return first.split(" ")[0].strip()
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        klass = a.get("class", "")
+
+        if tag == "div":
+            if "playerAvatarAutoSizeInner" in klass:
+                self.in_inner += 1
+            elif self.in_inner > 0 and "profile_avatar_frame" in klass:
+                self.in_frame += 1
+
+        if self.in_inner <= 0 or self.in_frame > 0:
+            return
+
+        if tag == "img":
+            url = None
+            if "srcset" in a:
+                url = self._first_url_from_srcset(a.get("srcset", ""))
+            if not url and "src" in a:
+                url = a.get("src")
+
+            if url:
+                lower_url = url.lower()
+                if self.animated is None and any(lower_url.endswith(ext) for ext in (".gif", ".webm", ".mp4")):
+                    self.animated = url
+                elif any(lower_url.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                    self.static_candidates.append(url)
+
+        if tag == "source":
+            media = (a.get("media") or "").strip()
+            url = self._first_url_from_srcset(a.get("srcset", "") or "")
+            if url and any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                if "prefers-reduced-motion" in media:
+                    self.static_candidates.insert(0, url)
+                else:
+                    self.static_candidates.append(url)
+
+    def handle_endtag(self, tag):
+        if tag != "div":
+            return
+        if self.in_frame > 0:
+            self.in_frame -= 1
+            return
+        if self.in_inner > 0:
+            self.in_inner -= 1
+
 class SteamProfileParser(HTMLParser):
-    """Parse le profil Steam pour extraire SteamID et avatar"""
+    """Parse le profil Steam pour extraire SteamID (pour la recherche par nom)"""
     def __init__(self):
         super().__init__()
         self.steam_id = None
-        self.avatar_url = None
         self.in_script = False
         
     def handle_starttag(self, tag, attrs):
-        attrs_dict = dict(attrs)
         if tag == 'script':
             self.in_script = True
-        if tag == 'link' and attrs_dict.get('rel') == 'image_src':
-            self.avatar_url = attrs_dict.get('href')
     
     def handle_endtag(self, tag):
         if tag == 'script':
@@ -202,27 +278,67 @@ def steam64_to_steam2(steam64):
     """Convertit SteamID64 en STEAM_0:X:Y"""
     try:
         steam64_int = int(steam64)
-        y = steam64_int - 76561197960265728
+        y = steam64_int - STEAMID64_BASE
         x = y % 2
         y = (y - x) // 2
         return f"STEAM_0:{x}:{y}"
     except:
         return None
 
-def fetch_steam_info(name):
-    """Récupère SteamID et avatar depuis le profil Steam"""
+def fetch_steam_avatar(steam_id):
+    """Récupère l'URL de l'avatar Steam à partir d'un Steam ID"""
     try:
+        steamid64 = steam2_to_steamid64(steam_id)
+        if not steamid64:
+            return None
+        
         # Anti rate-limit
         time.sleep(STEAM_DELAY)
         
-        search_url = f"https://steamcommunity.com/search/users/#text={requests.utils.quote(name)}"
+        url = f"https://steamcommunity.com/profiles/{steamid64}/?l=english"
+        r = requests.get(
+            url,
+            timeout=15,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            },
+        )
+        
+        if r.status_code == 429:
+            print(f"          ⏳ Rate-limit Steam, skip...")
+            return None
+        
+        r.raise_for_status()
+        
+        parser = SteamAvatarParser()
+        parser.feed(r.text)
+        
+        # Priorité à l'avatar animé, sinon statique
+        if parser.animated:
+            return parser.animated
+        if parser.static_candidates:
+            return parser.static_candidates[0]
+        
+        return None
+    except Exception as e:
+        return None
+
+def fetch_steam_info(name):
+    """Récupère SteamID et avatar depuis le profil Steam (recherche par nom)"""
+    try:
+        # Anti rate-limit
+        time.sleep(STEAM_DELAY)
         
         # Chercher le profil
         resp = requests.get(
             f"https://steamcommunity.com/search/SearchCommunityAjax",
             params={'text': name, 'filter': 'users', 'sessionid': '', 'page': 1},
-            headers={'User-Agent': 'Mozilla/5.0'},
-            timeout=5
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
+            timeout=10
         )
         
         if resp.status_code != 200:
@@ -238,60 +354,35 @@ def fetch_steam_info(name):
         
         profile_url = match.group(1)
         
+        # Anti rate-limit
+        time.sleep(STEAM_DELAY)
+        
         # Récupérer le profil
-        resp = requests.get(profile_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        resp = requests.get(
+            profile_url + "?l=english",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=15
+        )
         if resp.status_code != 200:
             return None, None
         
-        parser = SteamProfileParser()
-        parser.feed(resp.text)
+        # Extraire le SteamID
+        profile_parser = SteamProfileParser()
+        profile_parser.feed(resp.text)
+        steam2 = steam64_to_steam2(profile_parser.steam_id) if profile_parser.steam_id else None
         
-        steam2 = steam64_to_steam2(parser.steam_id) if parser.steam_id else None
-        return steam2, parser.avatar_url
+        # Extraire l'avatar
+        avatar_parser = SteamAvatarParser()
+        avatar_parser.feed(resp.text)
+        avatar = avatar_parser.animated or (avatar_parser.static_candidates[0] if avatar_parser.static_candidates else None)
+        
+        return steam2, avatar
         
     except Exception as e:
         return None, None
-
-def fetch_steam_avatar(steam2):
-    """Récupère l'avatar depuis un SteamID2"""
-    try:
-        if not steam2 or not steam2.startswith('STEAM_'):
-            return None
-        
-        parts = steam2.split(':')
-        if len(parts) != 3:
-            return None
-        
-        x, y = int(parts[1]), int(parts[2])
-        steam64 = 76561197960265728 + y * 2 + x
-        
-        api_key = os.environ.get('STEAM_API_KEY')
-        if api_key:
-            resp = requests.get(
-                'https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/',
-                params={'key': api_key, 'steamids': str(steam64)},
-                timeout=5
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                players = data.get('response', {}).get('players', [])
-                if players:
-                    return players[0].get('avatarfull')
-        
-        # Fallback: scraping
-        resp = requests.get(
-            f'https://steamcommunity.com/profiles/{steam64}',
-            headers={'User-Agent': 'Mozilla/5.0'},
-            timeout=5
-        )
-        if resp.status_code == 200:
-            parser = SteamProfileParser()
-            parser.feed(resp.text)
-            return parser.avatar_url
-        
-        return None
-    except:
-        return None
 
 # ============================================
 # Firebase
