@@ -676,19 +676,112 @@ def finalize_session(db, name, doc_id, started_at, ended_at, writes):
     
     # Récupérer les données du joueur
     data = cache['players'].get(doc_id, {})
-    new_total = data.get('total_time_seconds', 0) + duration
     
-    # Récupérer l'historique existant
-    existing_history = data.get('session_history', [])
+    # IMPORTANT: Faire une COPIE de l'historique pour éviter les modifications in-place
+    existing_history = list(data.get('session_history', []))
     
     # Créer l'entrée de session
+    start_iso = started_at.isoformat()
+    end_iso = ended_at.isoformat()
+    
+    # Normaliser le timestamp pour comparaison (enlever microsecondes)
+    start_normalized = started_at.replace(microsecond=0)
+    
+    # PROTECTION ANTI-DOUBLON ET NETTOYAGE
+    # Vérifier si cette session existe déjà ET nettoyer les doublons existants
+    cleaned_history = []
+    seen_starts = set()
+    session_exists = False
+    
+    for existing_session in existing_history:
+        existing_start = existing_session.get('start', '')
+        
+        # Parser le timestamp existant
+        try:
+            existing_start_dt = datetime.fromisoformat(existing_start.replace('Z', '+00:00'))
+            existing_start_normalized = existing_start_dt.replace(microsecond=0, tzinfo=None)
+            start_normalized_notz = start_normalized.replace(tzinfo=None)
+            
+            # Vérifier si c'est un doublon (même heure de début à la seconde près)
+            if abs((existing_start_normalized - start_normalized_notz).total_seconds()) < 60:
+                if existing_start in seen_starts:
+                    # Doublon détecté - ne pas ajouter
+                    print(f"          🧹 Nettoyage doublon pour {name}")
+                    continue
+                session_exists = True
+            
+            # Vérifier si c'est un doublon exact dans l'historique
+            if existing_start in seen_starts:
+                print(f"          🧹 Suppression doublon existant pour {name}")
+                continue
+            
+            seen_starts.add(existing_start)
+            cleaned_history.append(existing_session)
+            
+        except Exception as e:
+            # Si parsing échoue, garder la session mais marquer comme potentiellement problématique
+            if existing_start not in seen_starts:
+                seen_starts.add(existing_start)
+                cleaned_history.append(existing_session)
+    
+    if session_exists:
+        print(f"          ⏭️ {name}: session déjà enregistrée, ignorée")
+        # Si on a nettoyé des doublons, sauvegarder quand même
+        if len(cleaned_history) < len(existing_history):
+            try:
+                db.collection('players').document(doc_id).update({
+                    'session_history': cleaned_history,
+                    'session_count': len(cleaned_history)
+                })
+                update_player_cache(doc_id, {
+                    **data,
+                    'session_history': cleaned_history,
+                    'session_count': len(cleaned_history)
+                })
+                print(f"          🧹 Historique nettoyé: {len(existing_history)} → {len(cleaned_history)}")
+            except:
+                pass
+        return writes
+    
+    # PROTECTION ANTI-CHEVAUCHEMENT
+    # Vérifier si la nouvelle session chevauche une existante
+    for existing_session in cleaned_history:
+        try:
+            existing_start = existing_session.get('start', '')
+            existing_end = existing_session.get('end', '')
+            
+            existing_start_dt = datetime.fromisoformat(existing_start.replace('Z', '+00:00'))
+            existing_end_dt = datetime.fromisoformat(existing_end.replace('Z', '+00:00'))
+            
+            # Normaliser pour comparaison (ignorer timezone si différent)
+            es = existing_start_dt.replace(tzinfo=None)
+            ee = existing_end_dt.replace(tzinfo=None)
+            ns = started_at.replace(tzinfo=None) if started_at.tzinfo else started_at
+            ne = ended_at.replace(tzinfo=None) if ended_at.tzinfo else ended_at
+            
+            # Chevauchement: nouvelle session commence pendant une existante
+            if es < ns < ee:
+                print(f"          ⚠️ {name}: session chevauche une existante ({ns} entre {es} et {ee}), ignorée")
+                return writes
+            
+            # Chevauchement inverse: session existante commence pendant la nouvelle
+            if ns < es < ne:
+                print(f"          ⚠️ {name}: session existante chevauche la nouvelle, ignorée")
+                return writes
+                
+        except Exception as e:
+            # Continuer si parsing échoue
+            pass
+    
     new_session = {
-        'start': started_at.isoformat(),
-        'end': ended_at.isoformat(),
+        'start': start_iso,
+        'end': end_iso,
         'duration': duration
     }
-    existing_history.insert(0, new_session)
-    existing_history = existing_history[:MAX_SESSION_HISTORY]
+    cleaned_history.insert(0, new_session)
+    cleaned_history = cleaned_history[:MAX_SESSION_HISTORY]
+    
+    new_total = data.get('total_time_seconds', 0) + duration
     
     # Mettre à jour Firestore
     # IMPORTANT: Synchroniser session_count avec session_history.length
@@ -698,8 +791,8 @@ def finalize_session(db, name, doc_id, started_at, ended_at, writes):
             'total_time_seconds': new_total,
             'last_seen': firestore.SERVER_TIMESTAMP,
             'current_session_start': None,
-            'session_history': existing_history,
-            'session_count': len(existing_history)  # Toujours cohérent
+            'session_history': cleaned_history,
+            'session_count': len(cleaned_history)  # Toujours cohérent
         })
         writes += 1
         
@@ -707,8 +800,8 @@ def finalize_session(db, name, doc_id, started_at, ended_at, writes):
         update_player_cache(doc_id, {
             **data,
             'total_time_seconds': new_total,
-            'session_history': existing_history,
-            'session_count': len(existing_history)
+            'session_history': cleaned_history,
+            'session_count': len(cleaned_history)
         })
         
         # Ajouter au feed d'activité
