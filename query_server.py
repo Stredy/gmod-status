@@ -211,6 +211,40 @@ def steam2_to_steamid64(steamid):
     accountid = 2 * z + x
     return str(STEAMID64_BASE + accountid)
 
+class SteamSearchParser(HTMLParser):
+    """Extrait tous les <a class="searchPersonaName" href="...">NOM</a> de la recherche Steam"""
+    def __init__(self):
+        super().__init__()
+        self.results = []  # Liste de (nom, url)
+        self._in_target_a = False
+        self._current_href = None
+        self._current_text_parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        attr_dict = dict(attrs)
+        class_attr = attr_dict.get("class", "") or ""
+        classes = set(class_attr.split())
+        if "searchPersonaName" in classes and "href" in attr_dict:
+            self._in_target_a = True
+            self._current_href = attr_dict["href"]
+            self._current_text_parts = []
+
+    def handle_data(self, data):
+        if self._in_target_a:
+            self._current_text_parts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "a" and self._in_target_a:
+            name = "".join(self._current_text_parts).strip()
+            href = self._current_href or ""
+            if name and href:
+                self.results.append((name, href))
+            self._in_target_a = False
+            self._current_href = None
+            self._current_text_parts = []
+
 class SteamAvatarParser(HTMLParser):
     """Parse la page profil Steam pour extraire l'avatar"""
     def __init__(self):
@@ -345,9 +379,20 @@ def fetch_steam_avatar(steam_id):
     except Exception as e:
         return None
 
-def fetch_steam_info(name):
-    """Récupère SteamID et avatar depuis le profil Steam (recherche par nom)"""
+def fetch_steam_info(name, max_results_to_check=8):
+    """
+    Récupère SteamID et avatar depuis le profil Steam (recherche par nom).
+    
+    AMÉLIORATION: Cherche parmi les N premiers résultats pour trouver une
+    correspondance exacte (case-sensitive) au lieu de prendre le premier.
+    
+    Retourne (steam2, avatar) ou (None, None)
+    """
     try:
+        name = name.strip()
+        if not name:
+            return None, None
+        
         # Anti rate-limit
         time.sleep(STEAM_DELAY)
         
@@ -367,12 +412,31 @@ def fetch_steam_info(name):
         data = resp.json()
         html = data.get('html', '')
         
-        # Trouver le lien du profil
-        match = re.search(r'href="(https://steamcommunity\.com/(?:id|profiles)/[^"]+)"', html)
-        if not match:
+        # Parser HTML pour extraire tous les résultats
+        # Format: <a class="searchPersonaName" href="URL">NOM</a>
+        parser = SteamSearchParser()
+        parser.feed(html)
+        results = parser.results  # Liste de (nom, url)
+        
+        if not results:
             return None, None
         
-        profile_url = match.group(1)
+        # Chercher une correspondance exacte dans les N premiers résultats
+        exact_matches = []
+        for i, (result_name, result_url) in enumerate(results[:max_results_to_check]):
+            if result_name == name:  # Correspondance exacte (case-sensitive)
+                exact_matches.append((result_name, result_url))
+        
+        # Aucune correspondance exacte
+        if not exact_matches:
+            return None, None
+        
+        # Plusieurs correspondances exactes = ambiguïté, on ne peut pas choisir
+        if len(exact_matches) > 1:
+            print(f"        ⚠️ Multiples profils Steam trouvés pour '{name}'")
+            return None, None
+        
+        profile_url = exact_matches[0][1]
         
         # Anti rate-limit
         time.sleep(STEAM_DELAY)
@@ -1145,14 +1209,40 @@ def run_sync(db):
     
     # Supprimer tout document reset résiduel
     just_reset = False
+    just_reload = False
     try:
         reset_doc = db.collection('system').document('reset').get()
         if reset_doc.exists:
+            reset_data = reset_doc.to_dict()
+            reset_type = reset_data.get('type', 'reset')  # Par défaut = reset complet
             db.collection('system').document('reset').delete()
-            just_reset = True
-            print("    🧹 Document reset nettoyé - mode post-reset")
+            
+            if reset_type == 'reload':
+                just_reload = True
+                print("    🔄 Signal RELOAD détecté - rechargement des données")
+            else:
+                just_reset = True
+                print("    🧹 Signal RESET détecté - mode post-reset")
     except:
         pass
+    
+    # Si reload (mise à jour SteamID depuis script externe), juste recharger les données
+    if just_reload:
+        print("\n🔄 RECHARGEMENT DONNÉES")
+        cache['players'].clear()
+        cache['players_by_name'].clear()
+        docs = db.collection('players').get()
+        for doc in docs:
+            data = doc.to_dict()
+            doc_id = doc.id
+            cache['players'][doc_id] = data
+            name = data.get('name', '')
+            if name:
+                cache['players_by_name'][name.lower().strip()] = doc_id
+                cache['players_by_name'][normalize_name(name)] = doc_id
+        print(f"    ✅ {len(cache['players'])} joueurs rechargés depuis Firestore")
+        write_players_cache(db)
+        print(f"    📦 Cache mis à jour")
     
     # Query initial pour détecter les départs manqués
     print("\n🔍 DÉTECTION DÉPARTS MANQUÉS")
