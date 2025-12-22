@@ -596,9 +596,10 @@ def add_activity_event(event_type, name, duration=0, doc_id=None, timestamp=None
 # ============================================
 def check_and_handle_reset(db):
     """
-    Vérifie si un reset a été effectué depuis le frontend.
-    Si oui, recharge les données depuis Firestore.
-    Retourne True si un reset a été détecté.
+    Vérifie si un reset/reload a été demandé depuis le frontend ou un script externe.
+    - type='reload': Juste recharger les données des joueurs (après scanner, etc.)
+    - type='reset' ou autre: Reset complet avec réinitialisation des sessions
+    Retourne True si un signal a été détecté et traité.
     """
     try:
         doc = db.collection('system').document('reset').get()
@@ -607,6 +608,7 @@ def check_and_handle_reset(db):
         
         data = doc.to_dict()
         reset_at_str = data.get('reset_at')
+        reset_type = data.get('type', 'reset')  # Par défaut = reset complet
         
         if not reset_at_str:
             # Document existe mais pas de timestamp, le supprimer
@@ -622,14 +624,31 @@ def check_and_handle_reset(db):
         
         # Comparer avec le démarrage du run
         if cache['run_started_at'] and reset_at > cache['run_started_at']:
-            print(f"       🔄 RESET détecté! Rechargement des données...")
-            reload_players_from_firestore(db)
+            # Supprimer le flag avant traitement
+            db.collection('system').document('reset').delete()
+            
+            if reset_type == 'reload':
+                # Simple reload des données (après scanner, modification joueur, etc.)
+                print(f"       🔄 RELOAD détecté! Rechargement des données joueurs...")
+                cache['players'].clear()
+                cache['players_by_name'].clear()
+                docs = db.collection('players').get()
+                for doc in docs:
+                    player_data = doc.to_dict()
+                    doc_id = doc.id
+                    cache['players'][doc_id] = player_data
+                    name = player_data.get('name', '')
+                    if name:
+                        cache['players_by_name'][name.lower().strip()] = doc_id
+                        cache['players_by_name'][normalize_name(name)] = doc_id
+                print(f"       ✅ {len(cache['players'])} joueurs rechargés")
+            else:
+                # Reset complet avec réinitialisation des sessions
+                print(f"       🔄 RESET complet détecté! Rechargement des données...")
+                reload_players_from_firestore(db)
             
             # Mettre à jour run_started_at pour ne pas re-détecter
             cache['run_started_at'] = get_france_time()
-            
-            # Supprimer le flag de reset
-            db.collection('system').document('reset').delete()
             
             return True
         else:
