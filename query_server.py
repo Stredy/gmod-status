@@ -945,13 +945,33 @@ def write_players_cache(db):
         # (au cas où le frontend les a modifiés pendant ce run)
         existing = existing_cache.get(doc_id, {})
         
+        # Pour les ingame_names: TOUJOURS préférer le cache existant s'il a des données
+        # car c'est le frontend qui les gère, pas le backend
+        existing_ingame_names = existing.get('ingame_names', [])
+        backend_ingame_names = data.get('ingame_names', [])
+        # Prendre le plus long des deux (ne jamais perdre de données)
+        if len(existing_ingame_names) >= len(backend_ingame_names):
+            final_ingame_names = existing_ingame_names
+        else:
+            final_ingame_names = backend_ingame_names
+        
+        # Pour les roles: Préférer le cache existant s'il a des rôles non-default
+        existing_roles = existing.get('roles', [])
+        backend_roles = data.get('roles', ['Joueur'])
+        # Prendre les rôles qui ne sont pas juste ['Joueur']
+        if existing_roles and existing_roles != ['Joueur']:
+            final_roles = existing_roles
+        elif backend_roles and backend_roles != ['Joueur']:
+            final_roles = backend_roles
+        else:
+            final_roles = existing_roles or backend_roles or ['Joueur']
+        
         players_cache[doc_id] = {
             'name': data.get('name', '') or existing.get('name', ''),
             'steam_id': existing.get('steam_id') or data.get('steam_id', ''),  # Préférer le frontend
-            # Préférer les valeurs existantes du cache pour ces champs
-            'roles': existing.get('roles') or data.get('roles', ['Joueur']),
+            'roles': final_roles,
             'avatar_url': data.get('avatar_url', '') or existing.get('avatar_url', ''),
-            'ingame_names': existing.get('ingame_names') if existing.get('ingame_names') else data.get('ingame_names', []),
+            'ingame_names': final_ingame_names,
             'total_time_seconds': data.get('total_time_seconds', 0),
             'session_count': data.get('session_count', 0),
             'is_auto_detected': data.get('is_auto_detected', False),
