@@ -15,12 +15,13 @@ Gestion des cas limites:
 3. Workflow rate un run → les timestamps absolus permettent de recalculer
 4. Changement de nom Steam → détecté via SteamID
 
-Quotas Firebase:
-- Init: ~260 reads (1x par run)
+Quotas Firebase (optimisé):
+- Init: ~265 reads (1x par run)
+- Reset check: 6 reads/run (toutes les 10 queries)
 - Par query: 0-5 writes
-- Par run (60 queries): ~150 writes max
-- Par jour (48 runs): ~7500 writes, ~15000 reads
-- Limites: 20k writes, 50k reads → ~35% utilisé
+- Par run (60 queries): ~150 writes max, ~275 reads
+- Par jour (48 runs): ~7200 writes (36%), ~13200 reads (26%)
+- Limites Spark: 20k writes, 50k reads → ~35% utilisé max
 """
 
 import os
@@ -1527,14 +1528,19 @@ def run_sync(db):
     total_writes = writes
     steam_cache = {}  # Cache des lookups Steam (par run)
     
+    last_reset_check = 0  # Compteur pour limiter les checks reset
+
     while running and query_count < MAX_QUERIES:
         query_count += 1
         now = get_france_time()
         today = now.strftime('%Y-%m-%d')
         hour = now.hour
-        
-        # Vérifier si un reset a été effectué depuis le frontend
-        check_and_handle_reset(db)
+
+        # Vérifier reset toutes les 10 queries (~5 min) au lieu de chaque query
+        # Économise ~54 reads par run = ~2600 reads/jour
+        if query_count - last_reset_check >= 10:
+            check_and_handle_reset(db)
+            last_reset_check = query_count
         
         # Changement de jour ?
         if today != cache['today_date']:
