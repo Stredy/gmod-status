@@ -339,16 +339,23 @@ def steam64_to_steam2(steam64):
     except:
         return None
 
-def fetch_steam_avatar(steam_id):
-    """Récupère l'URL de l'avatar Steam à partir d'un Steam ID"""
+STEAM_RETRY_DELAY = 10   # Délai si rate-limité (secondes)
+STEAM_MAX_RETRIES = 2    # Nombre max de retries (moins que le script standalone)
+
+def fetch_steam_avatar(steam_id, retry_count=0):
+    """
+    Récupère l'URL de l'avatar Steam à partir d'un Steam ID.
+
+    AMÉLIORÉ: Gestion des retries sur rate-limit (429) avec backoff exponentiel.
+    """
     try:
         steamid64 = steam2_to_steamid64(steam_id)
         if not steamid64:
             return None
-        
+
         # Anti rate-limit
         time.sleep(STEAM_DELAY)
-        
+
         url = f"https://steamcommunity.com/profiles/{steamid64}/?l=english"
         r = requests.get(
             url,
@@ -359,112 +366,218 @@ def fetch_steam_avatar(steam_id):
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             },
         )
-        
+
+        # Gestion du rate-limiting avec retry
         if r.status_code == 429:
-            print(f"          ⏳ Rate-limit Steam, skip...")
-            return None
-        
+            if retry_count < STEAM_MAX_RETRIES:
+                wait_time = STEAM_RETRY_DELAY * (retry_count + 1)
+                print(f"          ⏳ Rate-limit Steam, attente {wait_time}s... (retry {retry_count + 1}/{STEAM_MAX_RETRIES})")
+                time.sleep(wait_time)
+                return fetch_steam_avatar(steam_id, retry_count + 1)
+            else:
+                print(f"          ⚠️ Rate-limit persistant après {STEAM_MAX_RETRIES} retries")
+                return None
+
         r.raise_for_status()
-        
+
         parser = SteamAvatarParser()
         parser.feed(r.text)
-        
+
         # Priorité à l'avatar animé, sinon statique
         if parser.animated:
             return parser.animated
         if parser.static_candidates:
             return parser.static_candidates[0]
-        
+
+        return None
+    except requests.exceptions.HTTPError as e:
+        if "429" in str(e) and retry_count < STEAM_MAX_RETRIES:
+            wait_time = STEAM_RETRY_DELAY * (retry_count + 1)
+            print(f"          ⏳ Rate-limit Steam, attente {wait_time}s... (retry {retry_count + 1}/{STEAM_MAX_RETRIES})")
+            time.sleep(wait_time)
+            return fetch_steam_avatar(steam_id, retry_count + 1)
         return None
     except Exception as e:
         return None
 
-def fetch_steam_info(name, max_results_to_check=8):
+def _extract_html_from_ajax_response(text):
+    """Extrait le HTML d'une réponse AJAX Steam"""
+    t = text.lstrip()
+    if t.startswith("{"):
+        try:
+            obj = json.loads(text)
+            for key in ("html", "results_html", "searchresults", "data"):
+                if key in obj and isinstance(obj[key], str):
+                    return obj[key]
+        except json.JSONDecodeError:
+            pass
+    return text
+
+def fetch_steam_info(name, max_pages=5, max_results_to_check=8):
     """
     Récupère SteamID et avatar depuis le profil Steam (recherche par nom).
-    
-    AMÉLIORATION: Cherche parmi les N premiers résultats pour trouver une
-    correspondance exacte (case-sensitive) au lieu de prendre le premier.
-    
+
+    AMÉLIORÉ: Basé sur le script fonctionnel update_steam_ids.py
+    - Récupère un sessionid valide avant la recherche
+    - Pagination sur plusieurs pages
+    - Vérification des doublons dans les pages suivantes
+
     Retourne (steam2, avatar) ou (None, None)
     """
     try:
         name = name.strip()
         if not name:
             return None, None
-        
+
+        # Créer une session pour garder les cookies
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Referer": "https://steamcommunity.com/search/users/",
+        })
+
         # Anti rate-limit
         time.sleep(STEAM_DELAY)
-        
-        # Chercher le profil
-        resp = requests.get(
-            f"https://steamcommunity.com/search/SearchCommunityAjax",
-            params={'text': name, 'filter': 'users', 'sessionid': '', 'page': 1},
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            },
-            timeout=10
-        )
-        
-        if resp.status_code != 200:
+
+        # IMPORTANT: Récupérer le sessionid (manquait dans l'ancienne version!)
+        try:
+            r0 = s.get("https://steamcommunity.com/", timeout=10)
+            r0.raise_for_status()
+        except requests.RequestException:
             return None, None
-        
-        data = resp.json()
-        html = data.get('html', '')
-        
-        # Parser HTML pour extraire tous les résultats
-        # Format: <a class="searchPersonaName" href="URL">NOM</a>
-        parser = SteamSearchParser()
-        parser.feed(html)
-        results = parser.results  # Liste de (nom, url)
-        
-        if not results:
+
+        sessionid = s.cookies.get("sessionid")
+        if not sessionid:
             return None, None
-        
+
+        def fetch_page(page):
+            """Récupère une page de résultats de recherche"""
+            time.sleep(STEAM_DELAY)
+            r = s.get(
+                "https://steamcommunity.com/search/SearchCommunityAjax",
+                params={
+                    "text": name,
+                    "filter": "users",
+                    "sessionid": sessionid,
+                    "steamid_user": "false",
+                    "page": str(page),
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            html = _extract_html_from_ajax_response(r.text)
+            parser = SteamSearchParser()
+            parser.feed(html)
+            return parser.results
+
+        # Récupérer la première page
+        try:
+            p1 = fetch_page(1)
+        except requests.RequestException:
+            return None, None
+
+        if not p1:
+            return None, None
+
+        # Collecter tous les résultats pour chercher dans les N premiers
+        all_results = list(p1)
+
+        # Si on n'a pas assez de résultats, charger plus de pages
+        current_page = 1
+        while len(all_results) < max_results_to_check and current_page < max_pages:
+            current_page += 1
+            try:
+                px = fetch_page(current_page)
+                if not px:
+                    break
+                all_results.extend(px)
+            except requests.RequestException:
+                break
+
         # Chercher une correspondance exacte dans les N premiers résultats
         exact_matches = []
-        for i, (result_name, result_url) in enumerate(results[:max_results_to_check]):
+        for i, (result_name, result_url) in enumerate(all_results[:max_results_to_check]):
             if result_name == name:  # Correspondance exacte (case-sensitive)
-                exact_matches.append((result_name, result_url))
-        
+                exact_matches.append((result_name, result_url, i + 1))
+
         # Aucune correspondance exacte
         if not exact_matches:
             return None, None
-        
-        # Plusieurs correspondances exactes = ambiguïté, on ne peut pas choisir
+
+        # Plusieurs correspondances exactes = ambiguïté
         if len(exact_matches) > 1:
             print(f"        ⚠️ Multiples profils Steam trouvés pour '{name}'")
             return None, None
-        
-        profile_url = exact_matches[0][1]
-        
-        # Anti rate-limit
-        time.sleep(STEAM_DELAY)
-        
-        # Récupérer le profil
-        resp = requests.get(
-            profile_url + "?l=english",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            timeout=15
-        )
-        if resp.status_code != 200:
+
+        matched_name, matched_href, position = exact_matches[0]
+
+        # Vérifier les doublons dans les pages suivantes
+        for page in range(current_page + 1, max_pages + 1):
+            try:
+                px = fetch_page(page)
+            except requests.RequestException:
+                break
+            if not px:
+                break
+            duplicate_count = sum(1 for n, _ in px if n == name)
+            if duplicate_count > 0:
+                print(f"        ⚠️ Doublon trouvé pour '{name}' en page {page}")
+                return None, None
+
+        # Extraire le SteamID64 de l'URL si possible
+        def extract_steamid64_from_url(url):
+            marker = "/profiles/"
+            if marker in url:
+                tail = url.split(marker, 1)[1]
+                digits = ""
+                for ch in tail:
+                    if ch.isdigit():
+                        digits += ch
+                    else:
+                        break
+                return digits if len(digits) >= 16 else None
+            return None
+
+        steamid64 = extract_steamid64_from_url(matched_href)
+
+        if not steamid64:
+            # Récupérer le SteamID64 depuis la page XML
+            time.sleep(STEAM_DELAY)
+            xml_url = matched_href.rstrip('/') + "?xml=1"
+            try:
+                r = s.get(xml_url, timeout=10)
+                r.raise_for_status()
+                # Parser XML simple pour <steamID64>
+                match = re.search(r'<steamID64>(\d+)</steamID64>', r.text)
+                if match:
+                    steamid64 = match.group(1)
+            except requests.RequestException:
+                pass
+
+        if not steamid64:
             return None, None
-        
-        # Extraire le SteamID
-        profile_parser = SteamProfileParser()
-        profile_parser.feed(resp.text)
-        steam2 = steam64_to_steam2(profile_parser.steam_id) if profile_parser.steam_id else None
-        
-        # Extraire l'avatar
-        avatar_parser = SteamAvatarParser()
-        avatar_parser.feed(resp.text)
-        avatar = avatar_parser.animated or (avatar_parser.static_candidates[0] if avatar_parser.static_candidates else None)
-        
+
+        steam2 = steam64_to_steam2(steamid64)
+        profile_url = f"https://steamcommunity.com/profiles/{steamid64}"
+
+        # Récupérer l'avatar
+        avatar = None
+        time.sleep(STEAM_DELAY)
+        try:
+            r = s.get(profile_url + "/?l=english", timeout=15)
+            if r.status_code == 200:
+                avatar_parser = SteamAvatarParser()
+                avatar_parser.feed(r.text)
+                if avatar_parser.animated:
+                    avatar = avatar_parser.animated
+                elif avatar_parser.static_candidates:
+                    avatar = avatar_parser.static_candidates[0]
+        except:
+            pass  # Avatar est optionnel
+
         return steam2, avatar
-        
+
     except Exception as e:
         return None, None
 
